@@ -19,4 +19,3 @@ class SimulatedSensor:
         ]
         for frame_id, pose in enumerate(poses, start=1):
             yield FramePacket(frame_id, float(frame_id), pose)
-

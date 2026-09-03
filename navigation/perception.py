@@ -30,4 +30,3 @@ class ScriptedPerception:
 
     def process(self, frame: FramePacket) -> list[Detection]:
         return list(self._frames.get(frame.frame_id, []))
-

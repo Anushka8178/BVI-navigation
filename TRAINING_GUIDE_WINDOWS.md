@@ -113,4 +113,3 @@ You can now show three distinct proofs:
 1. Dataset proof: conversion statistics and class counts.
 2. ML proof: loss curves, precision, recall, mAP, confusion matrix, and a saved checkpoint.
 3. Architecture proof: detections use the same `Detection` interface consumed by hazard triage, memory, attention, planning, and audio modules.
-

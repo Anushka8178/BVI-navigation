@@ -54,4 +54,3 @@ class ConsoleSpatialAudio:
             urgency=f"priority:{entry.priority:.2f}",
             message=self.TIMBRES.get(entry.label, "beep"),
         )
-

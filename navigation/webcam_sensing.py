@@ -35,4 +35,3 @@ class WebcamSensor:
                 )
         finally:
             capture.release()
-

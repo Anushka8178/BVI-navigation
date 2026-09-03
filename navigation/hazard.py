@@ -38,4 +38,3 @@ class HazardSeverityClassifier:
             f"motion={detection.motion.value}, class={detection.label}"
         )
         return SeverityResult(score, urgent, reason)
-

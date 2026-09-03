@@ -68,25 +68,25 @@ Maps class to timbre, distance to repetition band, and angle to left/ahead/right
 
 ## Questions the panel may ask
 
-**Why not implement the full project now?**  
+**Why not implement the full project now?**
 The full system requires calibrated hardware, GPU inference, training data, and user testing. This review prototype validates architecture, control flow, persistence, explainability, and failure behavior first.
 
-**Is the perception real?**  
+**Is the perception real?**
 Not in this prototype. Inputs are deterministic so every reviewer sees the same safety and memory cases. The perception interface is ready for a YOLO/SLAM adapter.
 
-**Is this really HRTF audio?**  
+**Is this really HRTF audio?**
 No. It implements the semantic contract for spatial audio but prints events. True HRTF requires a SOFA HRTF dataset and binaural convolution, planned for the next phase.
 
-**Why SQLite?**  
+**Why SQLite?**
 It is local, offline, lightweight, inspectable, and already part of the submitted technology stack.
 
-**How does it avoid duplicate hazards?**  
+**How does it avoid duplicate hazards?**
 The prototype uses stable object IDs from perception. The next version should associate detections by class plus a spatial matching radius, as described in the report pseudocode.
 
-**What if SLAM fails?**  
+**What if SLAM fails?**
 The system does not create guessed world-memory entries or play stale spatial cues. Frame-level hazard classification remains available, demonstrating graceful degradation.
 
-**What is novel here?**  
+**What is novel here?**
 The integration of field-of-view-independent egocentric hazard persistence, decay, top-k acoustic attention, and an urgent low-latency bypass within one assistive navigation pipeline.
 
 ## Next implementation milestones

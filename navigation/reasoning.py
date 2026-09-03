@@ -45,4 +45,3 @@ class ExplainablePathPlanner:
         )
         alternatives = [(route.name, value) for route, value, _, _ in scored[1:]]
         return PlanDecision(selected, score, rationale, alternatives)
-
