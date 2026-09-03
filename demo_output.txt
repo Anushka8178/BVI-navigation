@@ -1,0 +1,34 @@
+BVI NAVIGATION PROTOTYPE - six architecture tiers
+
+FRAME 1 | detections=2 | spatial-memory=2 | localization=OK
+  TOP-K MEMORY: AudioEvent(kind='ranked-awareness', label='stairs', direction='ahead', distance_band='far', urgency='priority:0.61', message='descending-tone')
+  TOP-K MEMORY: AudioEvent(kind='ranked-awareness', label='chair', direction='left', distance_band='far', urgency='priority:0.61', message='beep')
+
+FRAME 2 | detections=2 | spatial-memory=3 | localization=OK
+  URGENT BYPASS: AudioEvent(kind='immediate-bypass', label='person', direction='ahead', distance_band='near', urgency='critical:0.75', message='pulse fast repetition')
+  TOP-K MEMORY: AudioEvent(kind='ranked-awareness', label='person', direction='ahead', distance_band='near', urgency='priority:0.70', message='pulse')
+  TOP-K MEMORY: AudioEvent(kind='ranked-awareness', label='chair', direction='left', distance_band='far', urgency='priority:0.62', message='beep')
+  TOP-K MEMORY: AudioEvent(kind='ranked-awareness', label='stairs', direction='ahead', distance_band='far', urgency='priority:0.60', message='descending-tone')
+
+FRAME 3 | detections=2 | spatial-memory=4 | localization=OK
+  URGENT BYPASS: AudioEvent(kind='immediate-bypass', label='person', direction='ahead', distance_band='very-near', urgency='critical:0.83', message='pulse fast repetition')
+  TOP-K MEMORY: AudioEvent(kind='ranked-awareness', label='person', direction='ahead', distance_band='very-near', urgency='priority:0.79', message='pulse')
+  TOP-K MEMORY: AudioEvent(kind='ranked-awareness', label='chair', direction='left', distance_band='near', urgency='priority:0.61', message='beep')
+  TOP-K MEMORY: AudioEvent(kind='ranked-awareness', label='door', direction='right', distance_band='far', urgency='priority:0.59', message='chime')
+
+FRAME 4 | detections=2 | spatial-memory=5 | localization=OK
+  URGENT BYPASS: AudioEvent(kind='immediate-bypass', label='pothole', direction='ahead', distance_band='very-near', urgency='critical:0.72', message='low-click fast repetition')
+  TOP-K MEMORY: AudioEvent(kind='ranked-awareness', label='pothole', direction='left', distance_band='very-near', urgency='priority:0.79', message='low-click')
+  TOP-K MEMORY: AudioEvent(kind='ranked-awareness', label='person', direction='right', distance_band='very-near', urgency='priority:0.72', message='pulse')
+  TOP-K MEMORY: AudioEvent(kind='ranked-awareness', label='door', direction='right', distance_band='near', urgency='priority:0.63', message='chime')
+
+FRAME 5 | detections=1 | spatial-memory=5 | localization=LOST: frame alerts only
+
+FRAME 6 | detections=0 | spatial-memory=5 | localization=OK
+  TOP-K MEMORY: AudioEvent(kind='ranked-awareness', label='stairs', direction='ahead', distance_band='near', urgency='priority:0.62', message='descending-tone')
+  TOP-K MEMORY: AudioEvent(kind='ranked-awareness', label='door', direction='right', distance_band='near', urgency='priority:0.58', message='chime')
+  TOP-K MEMORY: AudioEvent(kind='ranked-awareness', label='pothole', direction='left', distance_band='very-near', urgency='priority:0.49', message='low-click')
+
+EXPLAINABLE ROUTE DECISION
+  Selected Courtyard detour: combined cost 1.10. It is 105m with base risk 0.05 and 0 remembered hazard(s) contributing 0.00 risk.
+  Alternative Main corridor: combined cost 1.53

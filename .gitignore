@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+
+# Dataset: never upload
+datasets/
+Obstacle Dataset/
+
+# Training outputs
+runs/
+
+# Model files
+*.pt
+*.onnx
+*.engine
+
+# Local databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Videos and generated media
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# Editor and operating system
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local configuration
+.env

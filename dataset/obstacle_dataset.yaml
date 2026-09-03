@@ -1,0 +1,23 @@
+# Replace path with the absolute path produced by tools/prepare_obstacle_dataset.py.
+path: datasets/obstacle_yolo
+train: images/train
+val: images/val
+test: images/test
+
+names:
+  0: stop_sign
+  1: person
+  2: bicycle
+  3: bus
+  4: truck
+  5: car
+  6: motorbike
+  7: reflective_cone
+  8: ashcan
+  9: warning_column
+  10: spherical_roadblock
+  11: pole
+  12: dog
+  13: tricycle
+  14: fire_hydrant
+
