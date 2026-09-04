@@ -103,9 +103,18 @@ class YOLOPerception:
 
     def _motion(self, object_id: str, distance: float) -> Motion:
         previous = self.previous_distances.get(object_id)
+
         self.previous_distances[object_id] = distance
-        if previous is not None and previous - distance > 0.25:
+
+        if previous is None:
+            return Motion.STATIC
+
+        distance_reduction = previous - distance
+        required_reduction = max(0.02, previous * 0.01)
+
+        if distance_reduction > required_reduction:
             return Motion.APPROACHING
+
         return Motion.STATIC
 
     def _fallback_id(self, label: str) -> int:
