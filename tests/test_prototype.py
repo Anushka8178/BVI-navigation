@@ -1,60 +1,124 @@
-import tempfile
-import unittest
-from pathlib import Path
+import numpy as np
 
-from navigation.hazard import HazardSeverityClassifier
-from navigation.memory import RouteMemory, SpatialMemory
-from navigation.models import Detection, Motion, Pose, RouteCandidate
-from navigation.reasoning import AcousticAttention, ExplainablePathPlanner
-
-
-class PrototypeTests(unittest.TestCase):
-    def test_approaching_near_person_is_urgent(self) -> None:
-        detection = Detection("p", "person", 0.1, 0.7, 0.95, Motion.APPROACHING)
-        result = HazardSeverityClassifier().classify(detection)
-        self.assertTrue(result.urgent)
-
-    def test_static_memory_fades_but_persists_after_leaving_view(self) -> None:
-        memory = SpatialMemory()
-        memory.update(Detection("c", "chair", 0.0, 2.0, 0.9), Pose(0, 0, 0), now=1.0)
-        memory.decay_and_prune(now=3.0)
-        self.assertEqual(len(memory.active()), 1)
-        self.assertTrue(0.0 < memory.active()[0].decay_weight < 0.9)
-
-    def test_invalid_localization_does_not_write_world_memory(self) -> None:
-        memory = SpatialMemory()
-        memory.update(
-            Detection("box", "box", 0.0, 1.0, 0.9),
-            Pose(0, 0, 0, localization_valid=False),
-            now=1.0,
-        )
-        self.assertFalse(memory.active())
-
-    def test_attention_limits_output_to_top_k(self) -> None:
-        memory = SpatialMemory()
-        pose = Pose(0, 0, 0)
-        for index in range(5):
-            memory.update(Detection(str(index), "chair", 0.0, index + 1.0, 0.9), pose, 1.0)
-        ranked = AcousticAttention(top_k=2).rank(memory.active(), pose)
-        self.assertEqual(len(ranked), 2)
-        self.assertGreaterEqual(ranked[0].priority, ranked[1].priority)
-
-    def test_planner_compares_route_costs(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            route_memory = RouteMemory(Path(temp_dir) / "test.db")
-            try:
-                planner = ExplainablePathPlanner(route_memory)
-                decision = planner.choose(
-                    [
-                        RouteCandidate("a", "short", 80, 0.1),
-                        RouteCandidate("b", "safe", 90, 0.2),
-                    ]
-                )
-                self.assertEqual(decision.selected.route_id, "a")
-                self.assertIn("Selected", decision.rationale)
-            finally:
-                route_memory.close()
+from navigation.hazard import (
+    HazardSeverityClassifier,
+)
+from navigation.models import (
+    Detection,
+    FramePacket,
+    Motion,
+)
+from navigation.pipeline import (
+    NavigationPipeline,
+)
 
 
-if __name__ == "__main__":
-    unittest.main()
+def create_detection(
+    distance: float,
+    relative_x: float = 0.0,
+    motion: Motion = Motion.STATIC,
+) -> Detection:
+    return Detection(
+        object_id="person-1",
+        label="person",
+        relative_x=relative_x,
+        relative_y=distance,
+        confidence=0.90,
+        motion=motion,
+    )
+
+
+def test_close_object_ahead_uses_safety_override() -> None:
+    detection = create_detection(
+        distance=2.0
+    )
+
+    classifier = HazardSeverityClassifier()
+
+    result = classifier.classify(
+        detection
+    )
+
+    assert result.urgent is True
+    assert "override=True" in result.reason
+
+
+def test_far_static_object_is_not_urgent() -> None:
+    detection = create_detection(
+        distance=10.0
+    )
+
+    classifier = HazardSeverityClassifier()
+
+    result = classifier.classify(
+        detection
+    )
+
+    assert result.urgent is False
+
+
+def test_approaching_object_has_more_risk() -> None:
+    classifier = HazardSeverityClassifier()
+
+    static_detection = create_detection(
+        distance=4.0,
+        motion=Motion.STATIC,
+    )
+
+    approaching_detection = create_detection(
+        distance=4.0,
+        motion=Motion.APPROACHING,
+    )
+
+    static_result = classifier.classify(
+        static_detection
+    )
+
+    approaching_result = classifier.classify(
+        approaching_detection
+    )
+
+    assert (
+        approaching_result.score
+        > static_result.score
+    )
+
+
+class FakePerception:
+    def process(
+        self,
+        frame: FramePacket,
+    ) -> list[Detection]:
+        return [
+            create_detection(
+                distance=2.0
+            )
+        ]
+
+
+def test_pipeline_emits_warning() -> None:
+    pipeline = NavigationPipeline(
+        perception=FakePerception(),
+        severity=HazardSeverityClassifier(),
+    )
+
+    # Tests must provide an actual image array,
+    # not object().
+    test_image = np.zeros(
+        (100, 100, 3),
+        dtype=np.uint8,
+    )
+
+    frame = FramePacket(
+        frame_id=1,
+        timestamp=0.0,
+        image=test_image,
+    )
+
+    result = pipeline.process_cycle(
+        frame
+    )
+
+    assert result.detection_count == 1
+    assert len(result.warnings) == 1
+    assert result.warnings[0].label == "person"

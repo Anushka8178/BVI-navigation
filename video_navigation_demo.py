@@ -1,52 +1,80 @@
 from __future__ import annotations
 
 import argparse
+import json
+import time
 from pathlib import Path
+from typing import Any
 
 import cv2
+import numpy as np
+from numpy.typing import NDArray
 
-from navigation.audio import ConsoleSpatialAudio
 from navigation.hazard import HazardSeverityClassifier
-from navigation.memory import RouteMemory, SpatialMemory
-from navigation.models import FramePacket, Pose
-from navigation.pipeline import NavigationPipeline
-from navigation.reasoning import (
-    AcousticAttention,
-    ExplainablePathPlanner,
-)
+from navigation.models import FramePacket
+from navigation.pipeline import CycleResult, NavigationPipeline
 from navigation.yolo_perception import YOLOPerception
 
 
-def play_warning() -> None:
-    """Play a basic warning sound on Windows."""
+ImageArray = NDArray[np.uint8]
 
-    try:
-        import winsound
 
-        winsound.MessageBeep(
-            winsound.MB_ICONEXCLAMATION
+def create_writer(
+    path: Path,
+    fps: float,
+    frame_size: tuple[int, int],
+) -> cv2.VideoWriter:
+    """
+    Create the output video writer.
+
+    frame_size must contain:
+        (width, height)
+    """
+
+    path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    fourcc = cv2.VideoWriter.fourcc(
+        "m",
+        "p",
+        "4",
+        "v",
+    )
+
+    writer = cv2.VideoWriter(
+        str(path),
+        fourcc,
+        fps,
+        frame_size,
+    )
+
+    if not writer.isOpened():
+        raise RuntimeError(
+            f"Could not create output video: {path.resolve()}"
         )
-    except (ImportError, RuntimeError):
-        # Ignore the sound if Windows audio is unavailable.
-        pass
+
+    return writer
 
 
 def draw_status(
-    image,
-    result,
-    video_time: float,
+    image: ImageArray,
+    result: CycleResult,
 ) -> None:
-    """Draw pipeline information on the video."""
+    """
+    Draw detection and warning information on the video frame.
+    """
 
-    height, width = image.shape[:2]
-    panel_height = min(245, height)
+    image_height, image_width = image.shape[:2]
+    panel_height = min(145, image_height)
 
     overlay = image.copy()
 
     cv2.rectangle(
         overlay,
         (0, 0),
-        (width, panel_height),
+        (image_width, panel_height),
         (0, 0, 0),
         -1,
     )
@@ -60,53 +88,41 @@ def draw_status(
         image,
     )
 
-    lines = [
-        f"Time: {video_time:.2f}s",
-        (
-            f"Detections: {result.detections} | "
-            f"Spatial memory: {result.memory_size}"
-        ),
-        "Pipeline: YOLO -> Hazard -> Memory -> Top-K -> Warning",
-    ]
+    if result.warnings:
+        lines = [
+            (
+                f"Detections: {result.detection_count} | "
+                f"Warnings: {len(result.warnings)}"
+            )
+        ]
 
-    if result.immediate_alerts:
-        for event in result.immediate_alerts[:2]:
+        for warning in result.warnings[:3]:
             lines.append(
-                f"URGENT: {event.label} | "
-                f"{event.direction} | "
-                f"{event.distance_band} | "
-                f"{event.urgency}"
+                f"WARNING: {warning.label} | "
+                f"{warning.direction} | "
+                f"{warning.distance_m:.1f} m | "
+                f"{warning.motion} | "
+                f"score={warning.score:.2f}"
             )
     else:
-        lines.append(
-            "Status: No immediate danger"
-        )
-
-    for event in result.awareness_alerts[:3]:
-        lines.append(
-            f"TOP-K: {event.label} | "
-            f"{event.direction} | "
-            f"{event.distance_band} | "
-            f"{event.urgency}"
-        )
+        lines = [
+            f"Detections: {result.detection_count}",
+            "Status: no urgent hazard",
+        ]
 
     for index, line in enumerate(lines):
-        if line.startswith("URGENT"):
-            color = (0, 0, 255)
-        elif line.startswith("TOP-K"):
-            color = (0, 255, 255)
+        if line.startswith("WARNING"):
+            colour = (0, 0, 255)
         else:
-            color = (255, 255, 255)
-
-        y_position = 28 + index * 28
+            colour = (255, 255, 255)
 
         cv2.putText(
             image,
             line,
-            (15, y_position),
+            (15, 30 + index * 32),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.62,
-            color,
+            0.65,
+            colour,
             2,
             cv2.LINE_AA,
         )
@@ -114,417 +130,322 @@ def draw_status(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description=(
-            "Offline video-based BVI navigation prototype"
-        )
+        description="Video-based BVI obstacle warning prototype"
     )
 
     parser.add_argument(
         "--weights",
         type=Path,
         required=True,
-        help="Path to the trained YOLO best.pt file",
+        help="Path to the trained best.pt file",
     )
 
     parser.add_argument(
         "--source",
         type=Path,
         required=True,
-        help="Path to the input video",
+        help="Path to the input MP4 video",
     )
 
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path(
-            "outputs/annotated_video.mp4"
-        ),
-        help="Path for the annotated output video",
+        required=True,
+        help="Path for the annotated MP4 video",
     )
 
     parser.add_argument(
         "--confidence",
         type=float,
         default=0.35,
-        help="Minimum YOLO confidence",
+        help="Minimum YOLO detection confidence",
+    )
+
+    parser.add_argument(
+        "--device",
+        default="0",
+        help="CUDA device number or cpu",
+    )
+
+    parser.add_argument(
+        "--no-display",
+        action="store_true",
+        help="Process without opening a video window",
     )
 
     args = parser.parse_args()
 
-    # Verify that the model exists.
     if not args.weights.exists():
         raise SystemExit(
             f"Trained model does not exist: "
-            f"{args.weights}"
+            f"{args.weights.resolve()}"
         )
 
-    # Verify that the input video exists.
     if not args.source.exists():
         raise SystemExit(
             f"Input video does not exist: "
-            f"{args.source}"
+            f"{args.source.resolve()}"
         )
 
-    # Create the output directory.
-    args.output.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    # Create the event-log path.
-    log_path = args.output.with_name(
-        f"{args.output.stem}_events.txt"
-    )
-
-    # Open the input video.
     capture = cv2.VideoCapture(
         str(args.source)
     )
 
     if not capture.isOpened():
         raise SystemExit(
-            f"Cannot open input video: "
-            f"{args.source}"
+            f"Could not open input video: "
+            f"{args.source.resolve()}"
         )
 
-    # Read video information.
-    fps = capture.get(
-        cv2.CAP_PROP_FPS
+    fps = float(
+        capture.get(cv2.CAP_PROP_FPS)
     )
 
     if fps <= 0:
-        fps = 25.0
+        fps = 30.0
 
-    width = int(
-        capture.get(
-            cv2.CAP_PROP_FRAME_WIDTH
-        )
+    frame_width = int(
+        capture.get(cv2.CAP_PROP_FRAME_WIDTH)
     )
 
-    height = int(
-        capture.get(
-            cv2.CAP_PROP_FRAME_HEIGHT
-        )
+    frame_height = int(
+        capture.get(cv2.CAP_PROP_FRAME_HEIGHT)
     )
 
-    total_frames = int(
-        capture.get(
-            cv2.CAP_PROP_FRAME_COUNT
-        )
-    )
-
-    # Create the output-video encoder.
-    fourcc: int = cv2.VideoWriter_fourcc(  # type: ignore[attr-defined]
-        *"mp4v"
-    )
-
-    writer = cv2.VideoWriter(
-        str(args.output),
-        fourcc,
-        fps,
-        (width, height),
-    )
-
-    if not writer.isOpened():
+    if frame_width <= 0 or frame_height <= 0:
         capture.release()
 
         raise SystemExit(
-            f"Cannot create output video: "
-            f"{args.output}"
+            "Could not determine the video's frame size."
         )
 
-    # Create the database directory.
-    database_path = (
-        Path(__file__).parent
-        / "data"
-        / "video_navigation.db"
-    )
-
-    database_path.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    # Create all architecture modules.
-    route_memory = RouteMemory(
-        database_path
-    )
+    try:
+        writer = create_writer(
+            path=args.output,
+            fps=fps,
+            frame_size=(
+                frame_width,
+                frame_height,
+            ),
+        )
+    except RuntimeError as error:
+        capture.release()
+        raise SystemExit(str(error)) from error
 
     perception = YOLOPerception(
         weights=args.weights,
         confidence=args.confidence,
+        device=args.device,
     )
 
-    severity_classifier = (
-        HazardSeverityClassifier()
-    )
-
-    spatial_memory = SpatialMemory()
-
-    attention = AcousticAttention(
-        top_k=3
-    )
-
-    planner = ExplainablePathPlanner(
-        route_memory
-    )
-
-    audio = ConsoleSpatialAudio()
-
-    # Connect the modules using the pipeline.
     pipeline = NavigationPipeline(
         perception=perception,
-        severity=severity_classifier,
-        spatial_memory=spatial_memory,
-        route_memory=route_memory,
-        attention=attention,
-        planner=planner,
-        audio=audio,
-        active_route=args.source.stem,
+        severity=HazardSeverityClassifier(),
     )
 
     frame_id = 0
+    warning_frames = 0
 
-    # Prevent repeated terminal warnings on every frame.
-    last_urgent_time = -10.0
-    last_awareness_time = -10.0
+    unique_warning_ids: set[str] = set()
 
-    print()
-    print("BVI OFFLINE VIDEO NAVIGATION")
-    print(
-        f"Input video : "
-        f"{args.source.resolve()}"
-    )
-    print(
-        f"Model       : "
-        f"{args.weights.resolve()}"
-    )
-    print(
-        f"Output video: "
-        f"{args.output.resolve()}"
-    )
-    print(
-        f"Event log   : "
-        f"{log_path.resolve()}"
-    )
-    print(
-        f"Resolution  : {width}x{height}"
-    )
-    print(
-        f"FPS         : {fps:.2f}"
-    )
-    print(
-        f"Frames      : {total_frames}"
-    )
-    print()
-    print("Processing started...")
-    print()
+    warning_events: list[
+        dict[str, Any]
+    ] = []
+
+    processing_started = time.perf_counter()
 
     try:
-        with log_path.open(
-            mode="w",
-            encoding="utf-8",
-        ) as log_file:
+        while True:
+            success, captured_image = capture.read()
 
-            log_file.write(
-                "BVI NAVIGATION VIDEO ANALYSIS\n"
+            if not success or captured_image is None:
+                break
+
+            # Convert OpenCV MatLike into a proper NumPy image.
+            image: ImageArray = np.asarray(
+                captured_image,
+                dtype=np.uint8,
             )
 
-            log_file.write(
-                f"Input video: "
-                f"{args.source.resolve()}\n"
+            frame_id += 1
+
+            timestamp = (
+                frame_id - 1
+            ) / fps
+
+            frame_packet = FramePacket(
+                frame_id=frame_id,
+                timestamp=timestamp,
+                image=image,
             )
 
-            log_file.write(
-                f"Model: "
-                f"{args.weights.resolve()}\n"
+            result = pipeline.process_cycle(
+                frame_packet
             )
 
-            log_file.write(
-                f"Resolution: "
-                f"{width}x{height}\n"
-            )
-
-            log_file.write(
-                f"FPS: {fps:.2f}\n"
-            )
-
-            log_file.write(
-                f"Total frames: "
-                f"{total_frames}\n\n"
-            )
-
-            while True:
-                ok, image = capture.read()
-
-                if not ok:
-                    break
-
-                frame_id += 1
-
-                # Calculate time using the video's FPS.
-                video_time = frame_id / fps
-
-                # Real SLAM is not implemented.
-                # A fixed pose is used for the prototype.
-                pose = Pose(
-                    0.0,
-                    0.0,
-                    0.0,
-                    localization_valid=True,
+            if perception.last_result is not None:
+                plotted_image = (
+                    perception.last_result.plot()
                 )
 
-                packet = FramePacket(
-                    frame_id=frame_id,
-                    timestamp=video_time,
-                    pose=pose,
-                    image=image,
+                display: ImageArray = np.asarray(
+                    plotted_image,
+                    dtype=np.uint8,
                 )
+            else:
+                display = image.copy()
 
-                # Run the complete navigation pipeline.
-                result = pipeline.process_cycle(
-                    packet
-                )
+            draw_status(
+                image=display,
+                result=result,
+            )
 
-                # Draw YOLO detection boxes.
-                if perception.last_result is not None:
-                    display = (
-                        perception
-                        .last_result
-                        .plot()
+            writer.write(display)
+
+            if result.warnings:
+                warning_frames += 1
+
+                for warning in result.warnings:
+                    unique_warning_ids.add(
+                        warning.object_id
                     )
-                else:
-                    display = image.copy()
 
-                # Draw warnings and pipeline information.
-                draw_status(
-                    display,
-                    result,
-                    video_time,
-                )
+                    warning_record = {
+                        "frame": frame_id,
+                        "time_s": round(
+                            timestamp,
+                            3,
+                        ),
+                        "object_id": (
+                            warning.object_id
+                        ),
+                        "label": warning.label,
+                        "direction": (
+                            warning.direction
+                        ),
+                        "distance_band": (
+                            warning.distance_band
+                        ),
+                        "distance_m": round(
+                            warning.distance_m,
+                            3,
+                        ),
+                        "score": round(
+                            warning.score,
+                            3,
+                        ),
+                        "motion": warning.motion,
+                        "reason": warning.reason,
+                    }
 
-                # Process urgent warnings.
-                urgent_warning_allowed = (
-                    video_time
-                    - last_urgent_time
-                    >= 1.0
-                )
+                    warning_events.append(
+                        warning_record
+                    )
 
-                if (
-                    result.immediate_alerts
-                    and urgent_warning_allowed
-                ):
-                    last_urgent_time = video_time
+                    print(
+                        f"WARNING "
+                        f"t={timestamp:.2f}s | "
+                        f"{warning.label} | "
+                        f"{warning.direction} | "
+                        f"{warning.distance_m:.1f} m | "
+                        f"{warning.motion} | "
+                        f"score={warning.score:.2f}"
+                    )
 
-                    play_warning()
-
-                    for event in result.immediate_alerts:
-                        message = (
-                            f"TIME {video_time:.2f}s | "
-                            f"URGENT BYPASS: {event}"
-                        )
-
-                        print(message)
-
-                        log_file.write(
-                            message + "\n"
-                        )
-
-                # Process normal Top-K awareness.
-                awareness_allowed = (
-                    video_time
-                    - last_awareness_time
-                    >= 1.0
-                )
-
-                if (
-                    result.awareness_alerts
-                    and awareness_allowed
-                ):
-                    last_awareness_time = video_time
-
-                    for event in result.awareness_alerts:
-                        message = (
-                            f"TIME {video_time:.2f}s | "
-                            f"TOP-K MEMORY: {event}"
-                        )
-
-                        print(message)
-
-                        log_file.write(
-                            message + "\n"
-                        )
-
-                # Save the annotated frame.
-                writer.write(display)
-
-                # Display the result while processing.
+            if not args.no_display:
                 cv2.imshow(
-                    (
-                        "BVI Offline Video Navigation "
-                        "- press Q to stop"
-                    ),
+                    "BVI Video Navigation - press Q to stop",
                     display,
                 )
 
-                # Press Q to stop.
                 pressed_key = (
                     cv2.waitKey(1) & 0xFF
                 )
 
                 if pressed_key == ord("q"):
-                    print()
                     print(
                         "Processing stopped by user."
                     )
                     break
 
-                # Print processing progress.
-                if frame_id % 100 == 0:
-                    if total_frames > 0:
-                        progress = (
-                            frame_id
-                            / total_frames
-                            * 100
-                        )
-                    else:
-                        progress = 0.0
-
-                    print(
-                        f"Processed "
-                        f"{frame_id}/"
-                        f"{total_frames} frames "
-                        f"({progress:.1f}%)"
-                    )
-
-            log_file.write(
-                "\nVIDEO PROCESSING COMPLETED\n"
-            )
-
-            log_file.write(
-                f"Processed frames: "
-                f"{frame_id}\n"
-            )
-
     finally:
         capture.release()
         writer.release()
-        route_memory.close()
         cv2.destroyAllWindows()
 
-    print()
-    print(
-        "Processing completed successfully."
+    processing_seconds = (
+        time.perf_counter()
+        - processing_started
     )
 
+    report = {
+        "source_video": str(
+            args.source.resolve()
+        ),
+        "model_weights": str(
+            args.weights.resolve()
+        ),
+        "annotated_video": str(
+            args.output.resolve()
+        ),
+        "frames_processed": frame_id,
+        "video_fps": fps,
+        "warning_frames": warning_frames,
+        "unique_warning_objects": len(
+            unique_warning_ids
+        ),
+        "processing_seconds": round(
+            processing_seconds,
+            3,
+        ),
+        "warning_events": warning_events,
+        "limitations": [
+            (
+                "Distance is estimated from object "
+                "height and is not measured depth."
+            ),
+            (
+                "Approaching motion is determined "
+                "from frame-to-frame estimated distance."
+            ),
+            (
+                "This prototype performs obstacle "
+                "awareness, not route planning."
+            ),
+        ],
+    }
+
+    report_path = args.output.with_suffix(
+        ".json"
+    )
+
+    report_path.write_text(
+        json.dumps(
+            report,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    print()
+    print("PROCESSING COMPLETE")
     print(
-        f"Annotated video saved to: "
+        f"Frames processed: {frame_id}"
+    )
+    print(
+        f"Warning frames: {warning_frames}"
+    )
+    print(
+        f"Unique warning objects: "
+        f"{len(unique_warning_ids)}"
+    )
+    print(
+        f"Annotated video: "
         f"{args.output.resolve()}"
     )
-
     print(
-        f"Event log saved to: "
-        f"{log_path.resolve()}"
+        f"JSON report: "
+        f"{report_path.resolve()}"
     )
 
 

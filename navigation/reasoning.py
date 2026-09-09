@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import math
 
-from .memory import RouteMemory
-from .models import HazardEntry, PlanDecision, Pose, RouteCandidate
 
 
 class AcousticAttention:
@@ -25,23 +23,3 @@ class AcousticAttention:
             )
         return sorted(entries, key=lambda item: item.priority, reverse=True)[: self.top_k]
 
-
-class ExplainablePathPlanner:
-    def __init__(self, route_memory: RouteMemory) -> None:
-        self.route_memory = route_memory
-
-    def choose(self, routes: list[RouteCandidate]) -> PlanDecision:
-        scored: list[tuple[RouteCandidate, float, int, float]] = []
-        for route in routes:
-            hazard_count, remembered_risk = self.route_memory.hazard_risk(route.route_id)
-            score = route.length_m / 100.0 + route.base_risk + 0.35 * remembered_risk
-            scored.append((route, score, hazard_count, remembered_risk))
-        scored.sort(key=lambda item: item[1])
-        selected, score, count, memory_risk = scored[0]
-        rationale = (
-            f"Selected {selected.name}: combined cost {score:.2f}. It is {selected.length_m:.0f}m "
-            f"with base risk {selected.base_risk:.2f} and {count} remembered hazard(s) "
-            f"contributing {memory_risk:.2f} risk."
-        )
-        alternatives = [(route.name, value) for route, value, _, _ in scored[1:]]
-        return PlanDecision(selected, score, rationale, alternatives)

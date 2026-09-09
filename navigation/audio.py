@@ -1,56 +1,35 @@
 from __future__ import annotations
 
-import math
-
-from .models import AudioEvent, Detection, HazardEntry, Pose
+from .models import Detection, WarningEvent
 
 
-class ConsoleSpatialAudio:
-    """Semantic audio adapter. Replace this class with a real HRTF renderer."""
+def direction_for(angle_deg: float) -> str:
+    if angle_deg < -20:
+        return "left"
+    if angle_deg > 20:
+        return "right"
+    return "ahead"
 
-    TIMBRES = {
-        "person": "pulse",
-        "pothole": "low-click",
-        "stairs": "descending-tone",
-        "door": "chime",
-    }
 
-    @staticmethod
-    def _direction(azimuth_deg: float) -> str:
-        if azimuth_deg < -15:
-            return "left"
-        if azimuth_deg > 15:
-            return "right"
-        return "ahead"
+def distance_band_for(distance_m: float) -> str:
+    if distance_m <= 2.5:
+        return "very-near"
+    if distance_m <= 5.0:
+        return "near"
+    if distance_m <= 10.0:
+        return "medium"
+    return "far"
 
-    @staticmethod
-    def _distance_band(distance: float) -> str:
-        if distance < 1.0:
-            return "very-near"
-        if distance < 2.5:
-            return "near"
-        return "far"
 
-    def immediate(self, detection: Detection, score: float) -> AudioEvent:
-        return AudioEvent(
-            kind="immediate-bypass",
-            label=detection.label,
-            direction=self._direction(detection.azimuth_deg),
-            distance_band=self._distance_band(detection.distance),
-            urgency=f"critical:{score:.2f}",
-            message=f"{self.TIMBRES.get(detection.label, 'beep')} fast repetition",
-        )
+def make_warning(detection: Detection, score: float, reason: str) -> WarningEvent:
+    return WarningEvent(
+        object_id=detection.object_id,
+        label=detection.label,
+        direction=direction_for(detection.azimuth_deg),
+        distance_band=distance_band_for(detection.distance),
+        distance_m=detection.distance,
+        score=score,
+        motion=detection.motion.value,
+        reason=reason,
+    )
 
-    def awareness(self, entry: HazardEntry, pose: Pose) -> AudioEvent:
-        dx, dy = entry.world_x - pose.x, entry.world_y - pose.y
-        distance = math.hypot(dx, dy)
-        world_bearing = math.degrees(math.atan2(dx, dy))
-        azimuth = (world_bearing - pose.heading_deg + 180) % 360 - 180
-        return AudioEvent(
-            kind="ranked-awareness",
-            label=entry.label,
-            direction=self._direction(azimuth),
-            distance_band=self._distance_band(distance),
-            urgency=f"priority:{entry.priority:.2f}",
-            message=self.TIMBRES.get(entry.label, "beep"),
-        )

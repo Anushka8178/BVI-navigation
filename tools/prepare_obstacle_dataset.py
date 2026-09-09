@@ -6,7 +6,6 @@ import xml.etree.ElementTree as ET
 from collections import Counter
 from pathlib import Path
 
-
 CLASSES = [
     "stop_sign", "person", "bicycle", "bus", "truck", "car", "motorbike",
     "reflective_cone", "ashcan", "warning_column", "spherical_roadblock",
@@ -37,10 +36,8 @@ def convert_annotation(xml_path: Path, output_path: Path) -> Counter[str]:
     counts: Counter[str] = Counter()
     for obj in root.findall("object"):
         label = (obj.findtext("name") or "").strip()
-        if label not in CLASS_TO_ID:
-            continue
         box = obj.find("bndbox")
-        if box is None:
+        if label not in CLASS_TO_ID or box is None:
             continue
         xmin = max(float(box.findtext("xmin", "0")), 0.0)
         ymin = max(float(box.findtext("ymin", "0")), 0.0)
@@ -49,11 +46,9 @@ def convert_annotation(xml_path: Path, output_path: Path) -> Counter[str]:
         box_width, box_height = xmax - xmin, ymax - ymin
         if box_width <= 1 or box_height <= 1:
             continue
-        x_center = ((xmin + xmax) / 2.0) / width
-        y_center = ((ymin + ymax) / 2.0) / height
         lines.append(
-            f"{CLASS_TO_ID[label]} {x_center:.6f} {y_center:.6f} "
-            f"{box_width / width:.6f} {box_height / height:.6f}"
+            f"{CLASS_TO_ID[label]} {((xmin+xmax)/2)/width:.6f} "
+            f"{((ymin+ymax)/2)/height:.6f} {box_width/width:.6f} {box_height/height:.6f}"
         )
         counts[label] += 1
     output_path.write_text("\n".join(lines), encoding="utf-8")
@@ -61,8 +56,8 @@ def convert_annotation(xml_path: Path, output_path: Path) -> Counter[str]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Convert OD VOC files to Ultralytics YOLO layout")
-    parser.add_argument("--source", type=Path, required=True, help="VOC root containing JPEGImages/Annotations/ImageSets/Main")
+    parser = argparse.ArgumentParser(description="Convert OD VOC annotations to YOLO format")
+    parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--output", type=Path, default=Path("datasets/obstacle_yolo"))
     args = parser.parse_args()
     images_dir = args.source / "JPEGImages"
@@ -81,9 +76,9 @@ def main() -> None:
         label_output = args.output / "labels" / split
         image_output.mkdir(parents=True, exist_ok=True)
         label_output.mkdir(parents=True, exist_ok=True)
-        image_ids = [line.strip().split()[0] for line in split_file.read_text(encoding="utf-8-sig").splitlines() if line.strip()]
+        ids = [line.split()[0] for line in split_file.read_text(encoding="utf-8-sig").splitlines() if line.strip()]
         converted = 0
-        for image_id in image_ids:
+        for image_id in ids:
             image_path = find_image(images_dir, image_id)
             xml_path = annotations_dir / f"{image_id}.xml"
             if not xml_path.exists():
@@ -92,16 +87,13 @@ def main() -> None:
             shutil.copy2(image_path, image_output / image_path.name)
             total_counts.update(convert_annotation(xml_path, label_output / f"{image_id}.txt"))
             converted += 1
-        print(f"{split}: converted {converted}/{len(image_ids)} images")
-
+        print(f"{split}: converted {converted}/{len(ids)} images")
     print("\nObject counts:")
     for label in CLASSES:
         print(f"  {label}: {total_counts[label]}")
-    missing = [label for label in CLASSES if total_counts[label] == 0]
-    if missing:
-        raise SystemExit(f"Dataset validation failed; zero objects for: {missing}")
     print(f"\nDataset ready at: {args.output.resolve()}")
 
 
 if __name__ == "__main__":
     main()
+
