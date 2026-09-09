@@ -77,12 +77,24 @@ Official OD VOC dataset
   -> validated YOLO dataset + obstacle_dataset.yaml
   -> train_detector.py (YOLOv8n transfer learning)
   -> evaluate_detector.py (untouched test split)
-  -> live_detector_demo.py (webcam/video)
+  -> video_detector_demo.py (recorded video)
   -> YOLOPerception Detection objects
   -> existing hazard/memory/reasoning/audio architecture
 ```
 
-The real adapter uses tracking IDs and approximate monocular ranging. RGB-D/SLAM can later replace the range and pose sources without changing hazard triage or reasoning.
+The video adapter uses tracking IDs and approximate monocular ranging. RGB-D/SLAM can later replace the range and pose sources without changing hazard triage or reasoning.
+
+Run detector-only inference on a recorded video:
+
+```bash
+python video_detector_demo.py --weights runs/detect/obstacle_yolov8n/weights/best.pt --video path/to/video.mp4
+```
+
+Run the full navigation pipeline on a recorded video:
+
+```bash
+python video_navigation_demo.py --weights runs/detect/obstacle_yolov8n/weights/best.pt --video path/to/video.mp4
+```
 
 ## Code-review walkthrough
 

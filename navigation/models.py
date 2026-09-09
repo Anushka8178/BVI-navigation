@@ -24,8 +24,8 @@ class Pose:
 class Detection:
     object_id: str
     label: str
-    relative_x: float  # metres; positive means right
-    relative_y: float  # metres; positive means forward
+    relative_x: float  
+    relative_y: float  
     confidence: float
     motion: Motion = Motion.STATIC
 

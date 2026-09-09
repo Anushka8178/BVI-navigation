@@ -36,3 +36,4 @@ Thumbs.db
 
 # Local configuration
 .env
+outputs/

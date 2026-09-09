@@ -44,7 +44,7 @@ Defines typed data passed between modules. This prevents one module from dependi
 
 ### `sensing.py`
 
-Produces synchronized frame and pose packets. It is simulated now; the real version will read the RGB-D camera and IMU.
+Produces synchronized frame and pose packets for the deterministic architecture demo.
 
 ### `perception.py`
 
@@ -91,7 +91,7 @@ The integration of field-of-view-independent egocentric hazard persistence, deca
 
 ## Next implementation milestones
 
-1. Replace scripted perception with a webcam/YOLO CPU adapter.
+1. Connect recorded-video YOLO detections to the complete navigation demo.
 2. Add monocular depth as a temporary substitute for RGB-D hardware.
 3. Replace stable IDs with spatial association and deduplication.
 4. Publish module messages as ROS2 topics after moving to Ubuntu/Jetson.

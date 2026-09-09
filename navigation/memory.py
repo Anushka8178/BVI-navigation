@@ -7,8 +7,7 @@ from pathlib import Path
 from .models import Detection, HazardEntry, Motion, Pose
 
 
-class SpatialMemory:
-    """Session cache: world-anchored hazards with class-dependent decay."""
+class SpatialMemory:    
 
     TTL = {
         Motion.STATIC: 12.0,
@@ -58,7 +57,6 @@ class SpatialMemory:
 
 
 class RouteMemory:
-    """Cross-session route and confirmed-hazard persistence."""
 
     def __init__(self, database_path: Path) -> None:
         database_path.parent.mkdir(parents=True, exist_ok=True)

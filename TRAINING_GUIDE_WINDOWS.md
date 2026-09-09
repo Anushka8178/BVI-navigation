@@ -90,18 +90,16 @@ Present these artifacts in the review:
 
 Do not select settings based on the test set. Use validation results while developing and run the test evaluation only for the final report.
 
-## 6. Demonstrate real inference
-
-Webcam:
+## 6. Demonstrate inference on a recorded video
 
 ```powershell
-python live_detector_demo.py --weights runs\detect\obstacle_yolov8n\weights\best.pt --source 0
+python video_detector_demo.py --weights runs\detect\obstacle_yolov8n\weights\best.pt --video "D:\demo\campus_walk.mp4"
 ```
 
-Recorded video:
+To demonstrate the complete navigation pipeline:
 
 ```powershell
-python live_detector_demo.py --weights runs\detect\obstacle_yolov8n\weights\best.pt --source "D:\demo\campus_walk.mp4"
+python video_navigation_demo.py --weights runs\detect\obstacle_yolov8n\weights\best.pt --video "D:\demo\campus_walk.mp4"
 ```
 
 The displayed distance is a monocular approximation based on bounding-box size. Call it “estimated distance,” not RGB-D depth. The detector and tracker are real; calibrated depth and SLAM remain the next hardware-dependent stage.

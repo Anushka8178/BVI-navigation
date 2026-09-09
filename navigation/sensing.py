@@ -6,7 +6,7 @@ from .models import FramePacket, Pose
 
 
 class SimulatedSensor:
-    """Deterministic camera/pose source used in place of hardware."""
+    """Deterministic frame/pose source used by the architecture demo."""
 
     def __iter__(self) -> Iterator[FramePacket]:
         poses = [

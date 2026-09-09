@@ -1,13 +1,31 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Protocol
 
 from .audio import ConsoleSpatialAudio
 from .hazard import HazardSeverityClassifier
 from .memory import RouteMemory, SpatialMemory
-from .models import AudioEvent, FramePacket, PlanDecision, RouteCandidate
-from .perception import ScriptedPerception
+from .models import (
+    AudioEvent,
+    Detection,
+    FramePacket,
+    PlanDecision,
+    RouteCandidate,
+)
 from .reasoning import AcousticAttention, ExplainablePathPlanner
+
+
+class PerceptionBackend(Protocol):
+    """
+    Common interface for every perception system.
+
+    ScriptedPerception and YOLOPerception both contain
+    a process() method that returns detections.
+    """
+
+    def process(self, frame: FramePacket) -> list[Detection]:
+        ...
 
 
 @dataclass(frozen=True)
@@ -21,11 +39,14 @@ class CycleResult:
 
 
 class NavigationPipeline:
-    """Orchestrates one processing cycle while keeping modules replaceable."""
+    """
+    Connects perception, hazard detection, memory,
+    attention, route reasoning and audio output.
+    """
 
     def __init__(
         self,
-        perception: ScriptedPerception,
+        perception: PerceptionBackend,
         severity: HazardSeverityClassifier,
         spatial_memory: SpatialMemory,
         route_memory: RouteMemory,
@@ -43,43 +64,83 @@ class NavigationPipeline:
         self.audio = audio
         self.active_route = active_route
 
-    def process_cycle(self, frame: FramePacket) -> CycleResult:
+    def process_cycle(
+        self,
+        frame: FramePacket,
+    ) -> CycleResult:
+        # Detect objects in the current frame.
         detections = self.perception.process(frame)
-        immediate: list[AudioEvent] = []
 
-        # Safety-critical path: classify and emit without waiting for memory ranking.
+        immediate_alerts: list[AudioEvent] = []
+
+        # Check every detection for immediate danger.
         for detection in detections:
-            result = self.severity.classify(detection)
-            if result.urgent:
-                immediate.append(self.audio.immediate(detection, result.score))
+            severity_result = self.severity.classify(detection)
 
-        # Always-executed memory path. Invalid localization safely prevents world anchoring.
+            if severity_result.urgent:
+                audio_event = self.audio.immediate(
+                    detection,
+                    severity_result.score,
+                )
+
+                immediate_alerts.append(audio_event)
+
+        # Add or update every detected object in spatial memory.
         for detection in detections:
-            self.spatial_memory.update(detection, frame.pose, frame.timestamp)
-        self.spatial_memory.decay_and_prune(frame.timestamp)
+            self.spatial_memory.update(
+                detection,
+                frame.pose,
+                frame.timestamp,
+            )
 
-        # Steady-state awareness path: limit output to top-k cached hazards.
-        ranked = (
-            self.attention.rank(self.spatial_memory.active(), frame.pose)
-            if frame.pose.localization_valid
-            else []
+        # Remove old memory entries.
+        self.spatial_memory.decay_and_prune(
+            frame.timestamp
         )
-        awareness = [self.audio.awareness(entry, frame.pose) for entry in ranked]
 
-        # Only stable, high-confidence static hazards become cross-session route facts.
+        # Rank remembered hazards only when localization is valid.
         if frame.pose.localization_valid:
-            for entry in ranked:
-                if entry.motion.value == "static" and entry.confidence >= 0.95:
-                    self.route_memory.remember_hazard(self.active_route, entry)
+            ranked_hazards = self.attention.rank(
+                self.spatial_memory.active(),
+                frame.pose,
+            )
+        else:
+            ranked_hazards = []
+
+        # Convert ranked hazards into awareness audio events.
+        awareness_alerts = [
+            self.audio.awareness(entry, frame.pose)
+            for entry in ranked_hazards
+        ]
+
+        # Store stable and highly confident hazards permanently.
+        if frame.pose.localization_valid:
+            for entry in ranked_hazards:
+                is_static = entry.motion.value == "static"
+                is_high_confidence = entry.confidence >= 0.95
+
+                if is_static and is_high_confidence:
+                    self.route_memory.remember_hazard(
+                        self.active_route,
+                        entry,
+                    )
 
         return CycleResult(
             frame_id=frame.frame_id,
             detections=len(detections),
-            immediate_alerts=immediate,
-            awareness_alerts=awareness,
+            immediate_alerts=immediate_alerts,
+            awareness_alerts=awareness_alerts,
             memory_size=len(self.spatial_memory.entries),
             localization_valid=frame.pose.localization_valid,
         )
 
-    def plan(self, routes: list[RouteCandidate]) -> PlanDecision:
+    def plan(
+        self,
+        routes: list[RouteCandidate],
+    ) -> PlanDecision:
+        """
+        Compare candidate routes and return the safest
+        explainable route decision.
+        """
+
         return self.planner.choose(routes)
