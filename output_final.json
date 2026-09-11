@@ -1,0 +1,685 @@
+{
+  "source_video": "C:\\Users\\anush\\OneDrive\\Desktop\\BVI-navigation\\video_for_testing.mp4",
+  "model_weights": "C:\\Users\\anush\\OneDrive\\Desktop\\BVI-navigation\\yolo11n.pt",
+  "annotated_video": "C:\\Users\\anush\\OneDrive\\Desktop\\BVI-navigation\\output_final.mp4",
+  "memory_db": "C:\\Users\\anush\\OneDrive\\Desktop\\BVI-navigation\\navigation_memory.db",
+  "frames_processed": 75,
+  "video_fps": 24.0,
+  "warning_frames": 23,
+  "unique_warning_objects": 5,
+  "processing_seconds": 26.106,
+  "warning_events": [
+    {
+      "frame": 8,
+      "time_s": 0.292,
+      "object_id": "person-3",
+      "label": "person",
+      "direction": "ahead",
+      "distance_band": "very-near",
+      "distance_m": 2.39,
+      "score": 0.685,
+      "motion": "approaching",
+      "reason": "distance=2.39m, angle=+18.4deg, motion=approaching, score=0.68, override=True",
+      "pose": {
+        "x": 0.146,
+        "y": 0.015,
+        "heading_deg": 0.29
+      }
+    },
+    {
+      "frame": 9,
+      "time_s": 0.333,
+      "object_id": "person-3",
+      "label": "person",
+      "direction": "ahead",
+      "distance_band": "very-near",
+      "distance_m": 2.268,
+      "score": 0.688,
+      "motion": "approaching",
+      "reason": "distance=2.27m, angle=+20.0deg, motion=approaching, score=0.69, override=True",
+      "pose": {
+        "x": 0.167,
+        "y": 0.017,
+        "heading_deg": 0.33
+      }
+    },
+    {
+      "frame": 21,
+      "time_s": 0.833,
+      "object_id": "person-4",
+      "label": "person",
+      "direction": "ahead",
+      "distance_band": "very-near",
+      "distance_m": 2.464,
+      "score": 0.688,
+      "motion": "approaching",
+      "reason": "distance=2.46m, angle=+12.5deg, motion=approaching, score=0.69, override=True",
+      "pose": {
+        "x": 0.417,
+        "y": 0.042,
+        "heading_deg": 0.83
+      }
+    },
+    {
+      "frame": 22,
+      "time_s": 0.875,
+      "object_id": "person-4",
+      "label": "person",
+      "direction": "ahead",
+      "distance_band": "very-near",
+      "distance_m": 2.347,
+      "score": 0.693,
+      "motion": "approaching",
+      "reason": "distance=2.35m, angle=+13.3deg, motion=approaching, score=0.69, override=True",
+      "pose": {
+        "x": 0.438,
+        "y": 0.044,
+        "heading_deg": 0.88
+      }
+    },
+    {
+      "frame": 23,
+      "time_s": 0.917,
+      "object_id": "person-4",
+      "label": "person",
+      "direction": "ahead",
+      "distance_band": "very-near",
+      "distance_m": 2.236,
+      "score": 0.697,
+      "motion": "approaching",
+      "reason": "distance=2.24m, angle=+14.1deg, motion=approaching, score=0.70, override=True",
+      "pose": {
+        "x": 0.458,
+        "y": 0.046,
+        "heading_deg": 0.92
+      }
+    },
+    {
+      "frame": 24,
+      "time_s": 0.958,
+      "object_id": "person-4",
+      "label": "person",
+      "direction": "ahead",
+      "distance_band": "very-near",
+      "distance_m": 2.197,
+      "score": 0.698,
+      "motion": "approaching",
+      "reason": "distance=2.20m, angle=+14.9deg, motion=approaching, score=0.70, override=True",
+      "pose": {
+        "x": 0.479,
+        "y": 0.048,
+        "heading_deg": 0.96
+      }
+    },
+    {
+      "frame": 25,
+      "time_s": 1.0,
+      "object_id": "person-4",
+      "label": "person",
+      "direction": "ahead",
+      "distance_band": "very-near",
+      "distance_m": 2.194,
+      "score": 0.397,
+      "motion": "static",
+      "reason": "distance=2.19m, angle=+15.6deg, motion=static, score=0.40, override=True",
+      "pose": {
+        "x": 0.5,
+        "y": 0.05,
+        "heading_deg": 1.0
+      }
+    },
+    {
+      "frame": 26,
+      "time_s": 1.042,
+      "object_id": "person-4",
+      "label": "person",
+      "direction": "ahead",
+      "distance_band": "very-near",
+      "distance_m": 2.185,
+      "score": 0.397,
+      "motion": "static",
+      "reason": "distance=2.19m, angle=+16.5deg, motion=static, score=0.40, override=True",
+      "pose": {
+        "x": 0.521,
+        "y": 0.052,
+        "heading_deg": 1.04
+      }
+    },
+    {
+      "frame": 27,
+      "time_s": 1.083,
+      "object_id": "person-4",
+      "label": "person",
+      "direction": "ahead",
+      "distance_band": "very-near",
+      "distance_m": 2.18,
+      "score": 0.396,
+      "motion": "static",
+      "reason": "distance=2.18m, angle=+17.3deg, motion=static, score=0.40, override=True",
+      "pose": {
+        "x": 0.542,
+        "y": 0.054,
+        "heading_deg": 1.08
+      }
+    },
+    {
+      "frame": 28,
+      "time_s": 1.125,
+      "object_id": "person-4",
+      "label": "person",
+      "direction": "ahead",
+      "distance_band": "very-near",
+      "distance_m": 2.163,
+      "score": 0.395,
+      "motion": "static",
+      "reason": "distance=2.16m, angle=+18.4deg, motion=static, score=0.40, override=True",
+      "pose": {
+        "x": 0.562,
+        "y": 0.056,
+        "heading_deg": 1.12
+      }
+    },
+    {
+      "frame": 29,
+      "time_s": 1.167,
+      "object_id": "person-4",
+      "label": "person",
+      "direction": "ahead",
+      "distance_band": "very-near",
+      "distance_m": 2.136,
+      "score": 0.695,
+      "motion": "approaching",
+      "reason": "distance=2.14m, angle=+19.4deg, motion=approaching, score=0.70, override=True",
+      "pose": {
+        "x": 0.583,
+        "y": 0.058,
+        "heading_deg": 1.17
+      }
+    },
+    {
+      "frame": 33,
+      "time_s": 1.333,
+      "object_id": "person-9",
+      "label": "person",
+      "direction": "ahead",
+      "distance_band": "very-near",
+      "distance_m": 2.367,
+      "score": 0.689,
+      "motion": "approaching",
+      "reason": "distance=2.37m, angle=-15.6deg, motion=approaching, score=0.69, override=True",
+      "pose": {
+        "x": 0.667,
+        "y": 0.067,
+        "heading_deg": 1.33
+      }
+    },
+    {
+      "frame": 34,
+      "time_s": 1.375,
+      "object_id": "person-9",
+      "label": "person",
+      "direction": "ahead",
+      "distance_band": "very-near",
+      "distance_m": 2.228,
+      "score": 0.694,
+      "motion": "approaching",
+      "reason": "distance=2.23m, angle=-16.7deg, motion=approaching, score=0.69, override=True",
+      "pose": {
+        "x": 0.688,
+        "y": 0.069,
+        "heading_deg": 1.38
+      }
+    },
+    {
+      "frame": 35,
+      "time_s": 1.417,
+      "object_id": "person-6",
+      "label": "person",
+      "direction": "ahead",
+      "distance_band": "very-near",
+      "distance_m": 2.438,
+      "score": 0.69,
+      "motion": "approaching",
+      "reason": "distance=2.44m, angle=+12.0deg, motion=approaching, score=0.69, override=True",
+      "pose": {
+        "x": 0.708,
+        "y": 0.071,
+        "heading_deg": 1.42
+      }
+    },
+    {
+      "frame": 35,
+      "time_s": 1.417,
+      "object_id": "person-9",
+      "label": "person",
+      "direction": "ahead",
+      "distance_band": "very-near",
+      "distance_m": 2.121,
+      "score": 0.698,
+      "motion": "approaching",
+      "reason": "distance=2.12m, angle=-18.0deg, motion=approaching, score=0.70, override=True",
+      "pose": {
+        "x": 0.708,
+        "y": 0.071,
+        "heading_deg": 1.42
+      }
+    },
+    {
+      "frame": 36,
+      "time_s": 1.458,
+      "object_id": "person-6",
+      "label": "person",
+      "direction": "ahead",
+      "distance_band": "very-near",
+      "distance_m": 2.273,
+      "score": 0.696,
+      "motion": "approaching",
+      "reason": "distance=2.27m, angle=+13.1deg, motion=approaching, score=0.70, override=True",
+      "pose": {
+        "x": 0.729,
+        "y": 0.073,
+        "heading_deg": 1.46
+      }
+    },
+    {
+      "frame": 36,
+      "time_s": 1.458,
+      "object_id": "person-9",
+      "label": "person",
+      "direction": "ahead",
+      "distance_band": "very-near",
+      "distance_m": 2.076,
+      "score": 0.698,
+      "motion": "approaching",
+      "reason": "distance=2.08m, angle=-19.7deg, motion=approaching, score=0.70, override=True",
+      "pose": {
+        "x": 0.729,
+        "y": 0.073,
+        "heading_deg": 1.46
+      }
+    },
+    {
+      "frame": 37,
+      "time_s": 1.5,
+      "object_id": "person-6",
+      "label": "person",
+      "direction": "ahead",
+      "distance_band": "very-near",
+      "distance_m": 2.196,
+      "score": 0.699,
+      "motion": "approaching",
+      "reason": "distance=2.20m, angle=+14.2deg, motion=approaching, score=0.70, override=True",
+      "pose": {
+        "x": 0.75,
+        "y": 0.075,
+        "heading_deg": 1.5
+      }
+    },
+    {
+      "frame": 38,
+      "time_s": 1.542,
+      "object_id": "person-6",
+      "label": "person",
+      "direction": "ahead",
+      "distance_band": "very-near",
+      "distance_m": 2.193,
+      "score": 0.398,
+      "motion": "static",
+      "reason": "distance=2.19m, angle=+15.5deg, motion=static, score=0.40, override=True",
+      "pose": {
+        "x": 0.771,
+        "y": 0.077,
+        "heading_deg": 1.54
+      }
+    },
+    {
+      "frame": 39,
+      "time_s": 1.583,
+      "object_id": "person-6",
+      "label": "person",
+      "direction": "ahead",
+      "distance_band": "very-near",
+      "distance_m": 2.196,
+      "score": 0.396,
+      "motion": "static",
+      "reason": "distance=2.20m, angle=+16.9deg, motion=static, score=0.40, override=True",
+      "pose": {
+        "x": 0.792,
+        "y": 0.079,
+        "heading_deg": 1.58
+      }
+    },
+    {
+      "frame": 40,
+      "time_s": 1.625,
+      "object_id": "person-6",
+      "label": "person",
+      "direction": "ahead",
+      "distance_band": "very-near",
+      "distance_m": 2.192,
+      "score": 0.394,
+      "motion": "static",
+      "reason": "distance=2.19m, angle=+18.5deg, motion=static, score=0.39, override=True",
+      "pose": {
+        "x": 0.812,
+        "y": 0.081,
+        "heading_deg": 1.62
+      }
+    },
+    {
+      "frame": 43,
+      "time_s": 1.75,
+      "object_id": "person-11",
+      "label": "person",
+      "direction": "ahead",
+      "distance_band": "very-near",
+      "distance_m": 2.387,
+      "score": 0.69,
+      "motion": "approaching",
+      "reason": "distance=2.39m, angle=-14.6deg, motion=approaching, score=0.69, override=True",
+      "pose": {
+        "x": 0.875,
+        "y": 0.088,
+        "heading_deg": 1.75
+      }
+    },
+    {
+      "frame": 44,
+      "time_s": 1.792,
+      "object_id": "person-11",
+      "label": "person",
+      "direction": "ahead",
+      "distance_band": "very-near",
+      "distance_m": 2.361,
+      "score": 0.69,
+      "motion": "approaching",
+      "reason": "distance=2.36m, angle=-15.6deg, motion=approaching, score=0.69, override=True",
+      "pose": {
+        "x": 0.896,
+        "y": 0.09,
+        "heading_deg": 1.79
+      }
+    },
+    {
+      "frame": 45,
+      "time_s": 1.833,
+      "object_id": "person-11",
+      "label": "person",
+      "direction": "ahead",
+      "distance_band": "very-near",
+      "distance_m": 2.348,
+      "score": 0.388,
+      "motion": "static",
+      "reason": "distance=2.35m, angle=-17.3deg, motion=static, score=0.39, override=True",
+      "pose": {
+        "x": 0.917,
+        "y": 0.092,
+        "heading_deg": 1.83
+      }
+    },
+    {
+      "frame": 46,
+      "time_s": 1.875,
+      "object_id": "person-11",
+      "label": "person",
+      "direction": "ahead",
+      "distance_band": "very-near",
+      "distance_m": 2.315,
+      "score": 0.687,
+      "motion": "approaching",
+      "reason": "distance=2.32m, angle=-19.4deg, motion=approaching, score=0.69, override=True",
+      "pose": {
+        "x": 0.938,
+        "y": 0.094,
+        "heading_deg": 1.88
+      }
+    }
+  ],
+  "persistent_memory": [
+    {
+      "object_id": "person-16",
+      "label": "person",
+      "world_x": 2.338,
+      "world_y": 6.291,
+      "confidence": 0.828,
+      "last_seen_timestamp": 3.083
+    },
+    {
+      "object_id": "traffic light-17",
+      "label": "traffic light",
+      "world_x": 1.515,
+      "world_y": 6.859,
+      "confidence": 0.676,
+      "last_seen_timestamp": 3.083
+    },
+    {
+      "object_id": "person-19",
+      "label": "person",
+      "world_x": 2.694,
+      "world_y": 6.052,
+      "confidence": 0.774,
+      "last_seen_timestamp": 3.083
+    },
+    {
+      "object_id": "person-21",
+      "label": "person",
+      "world_x": 3.67,
+      "world_y": 7.326,
+      "confidence": 0.769,
+      "last_seen_timestamp": 3.083
+    },
+    {
+      "object_id": "person-23",
+      "label": "person",
+      "world_x": 1.597,
+      "world_y": 9.031,
+      "confidence": 0.549,
+      "last_seen_timestamp": 3.083
+    },
+    {
+      "object_id": "car-25",
+      "label": "car",
+      "world_x": 7.875,
+      "world_y": 11.84,
+      "confidence": 0.449,
+      "last_seen_timestamp": 3.083
+    },
+    {
+      "object_id": "car-26",
+      "label": "car",
+      "world_x": -0.777,
+      "world_y": 20.019,
+      "confidence": 0.633,
+      "last_seen_timestamp": 3.083
+    },
+    {
+      "object_id": "person-33",
+      "label": "person",
+      "world_x": -4.754,
+      "world_y": 8.829,
+      "confidence": 0.746,
+      "last_seen_timestamp": 3.083
+    },
+    {
+      "object_id": "motorcycle-35",
+      "label": "motorcycle",
+      "world_x": -0.388,
+      "world_y": 7.334,
+      "confidence": 0.717,
+      "last_seen_timestamp": 3.083
+    },
+    {
+      "object_id": "person-37",
+      "label": "person",
+      "world_x": 2.169,
+      "world_y": 8.263,
+      "confidence": 0.733,
+      "last_seen_timestamp": 3.083
+    },
+    {
+      "object_id": "motorcycle-42",
+      "label": "motorcycle",
+      "world_x": -1.333,
+      "world_y": 6.215,
+      "confidence": 0.758,
+      "last_seen_timestamp": 3.083
+    },
+    {
+      "object_id": "person-28",
+      "label": "person",
+      "world_x": 5.267,
+      "world_y": 6.553,
+      "confidence": 0.695,
+      "last_seen_timestamp": 2.708
+    },
+    {
+      "object_id": "car-31",
+      "label": "car",
+      "world_x": -0.694,
+      "world_y": 3.112,
+      "confidence": 0.46,
+      "last_seen_timestamp": 2.667
+    },
+    {
+      "object_id": "car-34",
+      "label": "car",
+      "world_x": -7.095,
+      "world_y": 11.495,
+      "confidence": 0.627,
+      "last_seen_timestamp": 2.542
+    },
+    {
+      "object_id": "bench-29",
+      "label": "bench",
+      "world_x": 2.625,
+      "world_y": 2.936,
+      "confidence": 0.604,
+      "last_seen_timestamp": 2.25
+    },
+    {
+      "object_id": "person-11",
+      "label": "person",
+      "world_x": -0.152,
+      "world_y": 1.914,
+      "confidence": 0.913,
+      "last_seen_timestamp": 2.042
+    },
+    {
+      "object_id": "person-6",
+      "label": "person",
+      "world_x": 2.316,
+      "world_y": 2.36,
+      "confidence": 0.819,
+      "last_seen_timestamp": 1.958
+    },
+    {
+      "object_id": "person-7",
+      "label": "person",
+      "world_x": -0.226,
+      "world_y": 1.876,
+      "confidence": 0.88,
+      "last_seen_timestamp": 1.958
+    },
+    {
+      "object_id": "person-20",
+      "label": "person",
+      "world_x": 3.662,
+      "world_y": 4.665,
+      "confidence": 0.78,
+      "last_seen_timestamp": 1.75
+    },
+    {
+      "object_id": "person-9",
+      "label": "person",
+      "world_x": -0.163,
+      "world_y": 1.692,
+      "confidence": 0.892,
+      "last_seen_timestamp": 1.667
+    },
+    {
+      "object_id": "car-18",
+      "label": "car",
+      "world_x": 7.229,
+      "world_y": 15.431,
+      "confidence": 0.364,
+      "last_seen_timestamp": 1.625
+    },
+    {
+      "object_id": "person-4",
+      "label": "person",
+      "world_x": 2.171,
+      "world_y": 2.559,
+      "confidence": 0.897,
+      "last_seen_timestamp": 1.542
+    },
+    {
+      "object_id": "car-5",
+      "label": "car",
+      "world_x": -1.876,
+      "world_y": 4.197,
+      "confidence": 0.583,
+      "last_seen_timestamp": 1.542
+    },
+    {
+      "object_id": "person-8",
+      "label": "person",
+      "world_x": 2.921,
+      "world_y": 3.598,
+      "confidence": 0.627,
+      "last_seen_timestamp": 1.333
+    },
+    {
+      "object_id": "car-12",
+      "label": "car",
+      "world_x": -5.565,
+      "world_y": 9.821,
+      "confidence": 0.453,
+      "last_seen_timestamp": 1.167
+    },
+    {
+      "object_id": "person-13",
+      "label": "person",
+      "world_x": 3.199,
+      "world_y": 7.923,
+      "confidence": 0.559,
+      "last_seen_timestamp": 0.958
+    },
+    {
+      "object_id": "car-2",
+      "label": "car",
+      "world_x": -4.858,
+      "world_y": 7.634,
+      "confidence": 0.712,
+      "last_seen_timestamp": 0.917
+    },
+    {
+      "object_id": "person-3",
+      "label": "person",
+      "world_x": 1.266,
+      "world_y": 1.813,
+      "confidence": 0.909,
+      "last_seen_timestamp": 0.542
+    },
+    {
+      "object_id": "person-1",
+      "label": "person",
+      "world_x": 1.889,
+      "world_y": 2.636,
+      "confidence": 0.801,
+      "last_seen_timestamp": 0.417
+    },
+    {
+      "object_id": "person-10",
+      "label": "person",
+      "world_x": 2.894,
+      "world_y": 7.482,
+      "confidence": 0.617,
+      "last_seen_timestamp": 0.208
+    }
+  ],
+  "limitations": [
+    "Distance is estimated from object height, not measured depth.",
+    "Pose comes from a deterministic simulated trajectory (the documented SLAM stand-in in navigation/sensing.py), not real camera-based localization.",
+    "Approaching motion is determined from frame-to-frame estimated distance."
+  ]
+}
