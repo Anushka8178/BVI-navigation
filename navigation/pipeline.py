@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .audio import make_warning
 from .hazard import HazardSeverityClassifier
-from .models import FramePacket, WarningEvent
+from .models import Detection, FramePacket, WarningEvent
 
 
 @dataclass(frozen=True)
@@ -12,6 +12,7 @@ class CycleResult:
     frame_id: int
     detection_count: int
     warnings: list[WarningEvent]
+    detections: list[Detection] = field(default_factory=list)
 
 
 class NavigationPipeline:
@@ -26,5 +27,4 @@ class NavigationPipeline:
             result = self.severity.classify(detection)
             if result.urgent:
                 warnings.append(make_warning(detection, result.score, result.reason))
-        return CycleResult(frame.frame_id, len(detections), warnings)
-
+        return CycleResult(frame.frame_id, len(detections), warnings, detections)
