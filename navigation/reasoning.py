@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import math
-
+from .models import Pose
+from .memory import HazardEntry
 
 
 class AcousticAttention:
