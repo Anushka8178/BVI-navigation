@@ -40,6 +40,14 @@ Then run:
 python main.py
 ```
 
+> **Note (this branch):** `main.py` is not present on `slam-memory-demo`. The
+> six-tier deterministic console demo described below is illustrative of the
+> target architecture; on this branch, the equivalent working demos are
+> `localization_demo.py` (simulated SLAM + persistent memory, no video) and
+> `video_navigation_demo_slam_memory.py` (real YOLO detection + hazard
+> scoring + simulated SLAM + persistent memory, on a recorded video — see
+> below).
+
 Run the tests:
 
 ```bash
@@ -120,12 +128,102 @@ Run the full navigation pipeline on a recorded video:
 python video_navigation_demo.py --weights runs/detect/obstacle_yolov8n/weights/best.pt --video path/to/video.mp4
 ```
 
+`video_navigation_demo.py` covers detection and hazard scoring only — it does
+not touch localization or memory.
+
+### Full pipeline demo: detection + simulated SLAM + persistent memory
+
+`video_navigation_demo_slam_memory.py` wires the remaining two tiers in:
+
+```text
+video frame
+  -> YOLOPerception            (real YOLO detection + monocular distance/motion)
+  -> HazardSeverityClassifier  (rule-based hazard scoring)
+  -> simulated_pose()          (per-frame simulated localization, see navigation/sensing.py)
+  -> local_to_world()          (navigation/sensing.py, unchanged)
+  -> RouteMemory.remember()    (navigation/memory.py, SQLite persistence, unchanged)
+  -> AcousticAttention.rank()  (navigation/reasoning.py, unchanged)
+  -> annotated video + JSON report + navigation_memory.db
+```
+
+Every detected object is converted into world coordinates and written to
+`navigation_memory.db` on every frame, whether or not it triggered a
+warning. The video overlay shows the live simulated pose, active warnings,
+and the top-k hazards currently ranked from persistent memory.
+
+```bash
+python video_navigation_demo_slam_memory.py --weights yolo11n.pt --source path/to/video.mp4 --output output_final.mp4 --device cpu
+```
+
+Add `--reset` to clear `navigation_memory.db` before the run instead of
+appending to it. Add `--db path/to/file.db` to use a different database
+file.
+
+`simulated_pose()` is **not** real SLAM. It generates a deterministic
+walking trajectory per frame the same way `navigation/sensing.py`'s
+`SimulatedSensor` does for its six-frame demo, just extended to a video of
+any length. It exists so the rest of the pipeline (hazard triage, memory,
+reasoning) can be built and demonstrated against a stable interface before
+a real SLAM system (RealSense RGB-D + IMU → RTAB-Map/ORB-SLAM3 → `Pose`)
+is dropped in — see `navigation/sensing.py`'s own docstring.
+
+## Verifying persistent memory with SQL
+
+`video_navigation_demo_slam_memory.py` writes to `navigation_memory.db`, a
+plain SQLite file, through `navigation/memory.py`'s `RouteMemory` class. You
+can inspect it directly with SQL, independent of any of this project's
+Python code — the most convincing way to demonstrate the memory is real and
+actually persists.
+
+**One-time setup (Windows):** install the SQLite command-line shell if you
+don't already have it, then restart your terminal so `sqlite3` is on PATH:
+
+```powershell
+winget install -e --id SQLite.SQLite
+```
+
+**Inspect the database:**
+
+```powershell
+cd C:\path\to\BVI-navigation
+sqlite3 navigation_memory.db
+```
+
+At the `sqlite>` prompt:
+
+```sql
+.headers on
+.mode column
+.schema hazards
+
+SELECT COUNT(*) AS total_hazards FROM hazards;
+
+SELECT object_id, label, world_x, world_y, confidence, timestamp
+FROM hazards
+ORDER BY timestamp DESC
+LIMIT 15;
+
+.quit
+```
+
+`.schema hazards` shows the table was created by `RouteMemory._create_table()`,
+not hand-edited. The `SELECT` returns real rows written during the video
+run: object ID, label, the world-frame coordinates from `local_to_world()`,
+detection confidence, and the last-seen timestamp.
+
+If `sqlite3` isn't installed, the same data is reachable from Python's
+built-in `sqlite3` module without installing anything extra:
+
+```powershell
+python -c "import sqlite3; c = sqlite3.connect('navigation_memory.db'); c.row_factory = sqlite3.Row; [print(dict(r)) for r in c.execute('SELECT * FROM hazards ORDER BY timestamp DESC LIMIT 15')]"
+```
+
 ## Code-review walkthrough
 
 1. Start with `NavigationPipeline.process_cycle()` in `navigation/pipeline.py`. It is the architecture in executable form.
 2. Point out that urgent detections call the audio renderer immediately, before memory ranking.
 3. Point out that memory update is a separate unconditional step, so “bypass” means bypassing ranking latency, not skipping storage.
-4. Show `SpatialMemory.decay_and_prune()` and `AcousticAttention.rank()` as the main research contribution.
+4. Show `RouteMemory` (`navigation/memory.py`) and `AcousticAttention.rank()` (`navigation/reasoning.py`) as the main research contribution. **Note:** the time-decay/pruning behavior (`SpatialMemory.decay_and_prune()`) described in earlier drafts of this architecture is not implemented on this branch — `RouteMemory` persists hazards but does not currently age or prune them.
 5. Stop localization for one frame in the demo and show graceful degradation.
 6. Restart the program without `--reset` and show that route hazards remain in SQLite.
 
@@ -135,5 +233,12 @@ python video_navigation_demo.py --weights runs/detect/obstacle_yolov8n/weights/b
 - Positions are already expressed as relative 3D coordinates; no calibrated depth reconstruction is performed.
 - Audio is represented as structured console events, not true HRTF waveforms.
 - Route planning compares two predefined route candidates rather than a full semantic map.
+- `video_navigation_demo_slam_memory.py`'s pose comes from a deterministic
+  simulated trajectory (`simulated_pose()` / `navigation/sensing.py`), not
+  real camera-based localization.
+- YOLO's tracker can assign a new ID to the same physical object after
+  occlusion or brief loss of track, so persistent-memory object counts can
+  run higher than the number of distinct real-world objects actually
+  present.
 
 These are adapter-level limitations, not architectural shortcuts. The safety path, memory behavior, prioritization, persistence, explainability, and failure handling are executable.
