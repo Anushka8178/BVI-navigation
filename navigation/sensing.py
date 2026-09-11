@@ -31,6 +31,7 @@ it produces the position that persistent memory should actually store.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from math import cos, radians, sin
 from typing import NamedTuple
 
@@ -95,3 +96,46 @@ def local_to_world(pose: Pose, detection: Detection) -> WorldPoint:
     world_y = pose.y + detection.relative_x * sin(theta) + detection.relative_y * cos(theta)
 
     return WorldPoint(world_x, world_y)
+
+
+@dataclass(frozen=True)
+class LocalizedDetection:
+    """
+    The actual handoff object for persistent memory (navigation/memory.py).
+
+    `WorldPoint` alone is just an (x, y) pair - memory also needs to know
+    *which* hazard that point belongs to and how much to trust it. This
+    bundles the `WorldPoint` produced by `local_to_world()` together with
+    the rest of `Detection` that memory is expected to care about, so the
+    handoff is one object instead of several loose arguments:
+
+        memory.save(localize_detection(pose, detection))
+    """
+
+    object_id: str
+    label: str
+    world_x: float
+    world_y: float
+    confidence: float
+    motion: str
+    timestamp: float
+
+
+def localize_detection(pose: Pose, detection: Detection) -> LocalizedDetection:
+    """
+    Full localization handoff for one detection: run `local_to_world()` and
+    package the result with the detection metadata memory needs to store it.
+
+    This is the one function the memory module actually needs to call.
+    """
+    world = local_to_world(pose, detection)
+
+    return LocalizedDetection(
+        object_id=detection.object_id,
+        label=detection.label,
+        world_x=world.x,
+        world_y=world.y,
+        confidence=detection.confidence,
+        motion=detection.motion.value,
+        timestamp=pose.timestamp,
+    )

@@ -67,6 +67,30 @@ python main.py --reset
 
 The interfaces are intentional. A real detector can replace `ScriptedPerception` as long as it returns `Detection` objects; other modules do not need to change.
 
+## Simulated localization demo
+
+`navigation/sensing.py` is the localization stand-in used until real SLAM exists:
+
+```text
+SimulatedSensor -> Pose -> Detection -> local_to_world() -> WorldPoint
+                                                                |
+                                               LocalizedDetection (handoff)
+                                                                |
+                                                   memory.save(...)  [teammate's module]
+```
+
+- `SimulatedSensor` emits six fixed, deterministic `Pose` objects (no camera, no IMU) standing in for a future real SLAM system (RealSense RGB-D + IMU -> RTAB-Map/ORB-SLAM3 -> `Pose`). Nothing downstream needs to change when that swap happens.
+- `local_to_world(pose, detection)` rotates and translates a detection's camera-relative `(relative_x, relative_y)` by the current pose's heading and position, producing a `WorldPoint(x, y)`. Heading 0° means the robot's +x direction.
+- `localize_detection(pose, detection)` is the actual handoff function: it calls `local_to_world()` and bundles the result with the detection's id, label, confidence, motion, and the pose's timestamp into a `LocalizedDetection`, ready for `navigation/memory.py` (not yet implemented) to consume, e.g. `memory.save(localized)`.
+
+Run the localization-only demo (no OpenCV/YOLO required):
+
+```bash
+python localization_demo.py
+```
+
+It prints, for each of the six simulated frames, the robot pose, the hand-picked hazard detection's local position, its resulting world position, and the `LocalizedDetection` that would be handed to memory.
+
 ## Real dataset and GPU path
 
 Follow `TRAINING_GUIDE_WINDOWS.md`. The workflow is:
