@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .audio import make_warning
 from .hazard import HazardSeverityClassifier
 from .hrtf_renderer import HRTFRenderer
-from .models import FramePacket, WarningEvent
+from .models import Detection, FramePacket, WarningEvent
 
 
 @dataclass(frozen=True)
@@ -13,6 +13,7 @@ class CycleResult:
     frame_id: int
     detection_count: int
     warnings: list[WarningEvent]
+    detections: list[Detection] = field(default_factory=list)
 
 
 class NavigationPipeline:
@@ -58,4 +59,5 @@ class NavigationPipeline:
             frame.frame_id,
             len(detections),
             warnings,
+            detections,
         )
