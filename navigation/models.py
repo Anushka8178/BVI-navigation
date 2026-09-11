@@ -66,6 +66,7 @@ class WarningEvent:
     object_id: str
     label: str
     direction: str
+    azimuth_deg: float
     distance_band: str
     distance_m: float
     score: float
