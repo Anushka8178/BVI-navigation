@@ -40,6 +40,26 @@ class FramePacket:
     timestamp: float
     image: ImageArray
 
+@dataclass(frozen=True)
+class Pose:
+    """
+    Where the person/robot is in the world, at one point in time.
+
+    For tomorrow's demo this is produced by `navigation.sensing.SimulatedSensor`
+    (a fixed, hand-authored walking path). Later it will be produced by a real
+    SLAM system instead:
+
+        RealSense RGB-D + IMU -> RTAB-Map / ORB-SLAM3 -> Pose
+
+    Nothing downstream (this class included) needs to know or care which of
+    those two produced it - that's the whole point of having this type.
+    """
+
+    x: float
+    y: float
+    heading_deg: float
+    timestamp: float
+
 
 @dataclass(frozen=True)
 class WarningEvent:
