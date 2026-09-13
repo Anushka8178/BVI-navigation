@@ -1,0 +1,16 @@
+{
+  "source_video": "D:\\newbvi\\videos\\video1.mp4",
+  "model_weights": "D:\\newbvi\\runs\\detect\\runs\\detect\\obstacle_train_b4\\weights\\best.pt",
+  "annotated_video": "D:\\newbvi\\videos\\video1_annotated.mp4",
+  "frames_processed": 141,
+  "video_fps": 24.0,
+  "warning_frames": 0,
+  "unique_warning_objects": 0,
+  "processing_seconds": 19.318,
+  "warning_events": [],
+  "limitations": [
+    "Distance is estimated from object height and is not measured depth.",
+    "Approaching motion is determined from frame-to-frame estimated distance.",
+    "This prototype performs obstacle awareness, not route planning."
+  ]
+}
