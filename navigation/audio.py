@@ -4,9 +4,9 @@ from .models import Detection, WarningEvent
 
 
 def direction_for(angle_deg: float) -> str:
-    if angle_deg < -20:
+    if angle_deg < -20.0:
         return "left"
-    if angle_deg > 20:
+    if angle_deg > 20.0:
         return "right"
     return "ahead"
 
@@ -25,6 +25,8 @@ def make_warning(
     detection: Detection,
     score: float,
     reason: str,
+    category: str = "NON_ACTIONABLE",
+    ttc_s: float | None = None,
 ) -> WarningEvent:
     return WarningEvent(
         object_id=detection.object_id,
@@ -36,4 +38,6 @@ def make_warning(
         score=score,
         motion=detection.motion.value,
         reason=reason,
+        category=category,
+        ttc_s=ttc_s,
     )

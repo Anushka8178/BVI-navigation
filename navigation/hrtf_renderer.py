@@ -1,4 +1,7 @@
+from __future__ import annotations
+
 import time
+
 import numpy as np
 import sounddevice as sd
 import sofar
@@ -6,6 +9,29 @@ from scipy import signal
 
 
 class HRTFRenderer:
+    """SOFA HRTF renderer for urgent hazards and soft path guidance.
+
+    Coordinate conventions
+    -----------------------
+    The rest of the navigation system uses:
+
+        negative azimuth = LEFT
+        0 degrees        = AHEAD
+        positive azimuth = RIGHT
+
+    The MIT KEMAR SOFA file used by this project has the opposite
+    horizontal azimuth convention:
+
+        positive SOFA azimuth = LEFT
+        negative / 360-SOFA  = RIGHT
+
+    Therefore this renderer performs the conversion:
+
+        physical azimuth -> SOFA azimuth
+
+    exactly once, immediately before HRTF lookup.
+    """
+
     def __init__(
         self,
         sofa_path="hrtf/mit_kemar_normal_pinna.sofa",
@@ -16,47 +42,90 @@ class HRTFRenderer:
 
         self.sofa_path = sofa_path
 
-        # Use this loader because the file uses:
-        # SimpleFreeFieldHRIR v0.3
-        self.sofa = sofar.read_sofa_as_netcdf(sofa_path)
+        self.sofa = sofar.read_sofa_as_netcdf(
+            sofa_path
+        )
 
-        # Correct field names for read_sofa_as_netcdf().
-        self.sample_rate = int(np.asarray(self.sofa.Data_SamplingRate).flat[0])
+        self.sample_rate = int(
+            np.asarray(
+                self.sofa.Data_SamplingRate
+            ).flat[0]
+        )
 
-        self.warning_cooldown = float(warning_cooldown)
+        # --------------------------------------------------
+        # Urgent warning cooldown
+        # --------------------------------------------------
+
+        self.warning_cooldown = float(
+            warning_cooldown
+        )
+
         self.last_warning_time = 0.0
-        self.path_guidance_cooldown = 1.2
+
+        # --------------------------------------------------
+        # Soft path-guidance cooldown
+        # --------------------------------------------------
+
+        self.path_guidance_cooldown = 1.0
         self.last_path_guidance_time = 0.0
 
-        self.device = output_device
+        # --------------------------------------------------
+        # Output device
+        # --------------------------------------------------
 
-        if self.device is None:
-            self.device = self.find_output_device()
+        self.device = (
+            output_device
+            if output_device is not None
+            else self.find_output_device()
+        )
 
-        print(f"HRTF sample rate: {self.sample_rate}")
-        print(f"Audio output device: {self.device}")
+        print(
+            f"HRTF sample rate: {self.sample_rate}"
+        )
+
+        print(
+            f"Audio output device: {self.device}"
+        )
 
         if self.device is not None:
             try:
-                device_info = sd.query_devices(self.device)
-                print(f"Using audio device: {device_info['name']}")
+                device_info = sd.query_devices(
+                    self.device
+                )
+
+                print(
+                    f"Using audio device: "
+                    f"{device_info['name']}"
+                )
+
             except Exception as error:
-                print(f"Could not query audio device: {error}")
+                print(
+                    f"Could not query audio device: "
+                    f"{error}"
+                )
+
+    # ======================================================
+    # OUTPUT DEVICE
+    # ======================================================
 
     def find_output_device(self):
-        """
-        Find a suitable audio output device.
-        """
+        """Find a suitable headphone/output device."""
+
         try:
             devices = sd.query_devices()
 
             print("\nAvailable audio devices:")
 
-            for index, device in enumerate(devices):
+            for index, device in enumerate(
+                devices
+            ):
                 print(
-                    f"{index}: {device['name']} | "
-                    f"inputs={device['max_input_channels']} | "
-                    f"outputs={device['max_output_channels']}"
+                    f"{index}: "
+                    f"{device['name']} | "
+                    f"inputs="
+                    f"{device['max_input_channels']} | "
+                    f"outputs="
+                    f"{device['max_output_channels']}"
                 )
 
             preferred_keywords = [
@@ -68,281 +137,559 @@ class HRTFRenderer:
                 "earbud",
             ]
 
-            for index, device in enumerate(devices):
-                device_name = device["name"].lower()
+            for index, device in enumerate(
+                devices
+            ):
+                name = (
+                    device["name"]
+                    .lower()
+                )
 
-                if device["max_output_channels"] > 0:
-                    if any(
-                        keyword in device_name
+                if (
+                    device["max_output_channels"] > 0
+                    and any(
+                        keyword in name
                         for keyword in preferred_keywords
-                    ):
-                        print(f"Automatically selected output device {index}")
-                        return index
+                    )
+                ):
+                    print(
+                        "Automatically selected "
+                        f"output device {index}"
+                    )
+
+                    return index
 
             default_device = sd.default.device
 
-            if isinstance(default_device, (list, tuple)):
-                default_output = default_device[1]
+            if isinstance(
+                default_device,
+                (list, tuple),
+            ):
+                default_output = (
+                    default_device[1]
+                )
             else:
                 default_output = default_device
 
-            print(f"Using default output device: {default_output}")
+            print(
+                "Using default output device: "
+                f"{default_output}"
+            )
+
             return default_output
 
         except Exception as error:
-            print(f"Could not find output device: {error}")
+            print(
+                f"Could not find output device: "
+                f"{error}"
+            )
+
             return None
 
-    def find_nearest_hrtf(self, azimuth_deg):
+    # ======================================================
+    # COORDINATE CONVERSION
+    # ======================================================
+
+    @staticmethod
+    def physical_to_sofa_azimuth(
+        azimuth_deg: float,
+    ) -> float:
+        """Convert project physical azimuth to SOFA azimuth.
+
+        Project convention:
+            negative = LEFT
+            0        = AHEAD
+            positive = RIGHT
+
+        MIT KEMAR SOFA convention observed in this file:
+            positive = LEFT
+            270/330  = RIGHT
+
+        Examples:
+            physical -30° -> SOFA 30°
+            physical   0° -> SOFA 0°
+            physical +30° -> SOFA 330°
+
+        The result is normalized to [0, 360).
         """
-        Find the nearest HRTF measurement for the requested azimuth.
+
+        return (
+            -float(azimuth_deg)
+        ) % 360.0
+
+    # ======================================================
+    # HRTF LOOKUP
+    # ======================================================
+
+    def find_nearest_hrtf(
+        self,
+        sofa_azimuth_deg: float,
+    ):
+        """Find nearest horizontal-plane HRTF measurement.
+
+        The argument MUST already be in SOFA azimuth convention.
+
+        Elevation 0 degrees is preferred because the navigation
+        cues represent horizontal left/right/ahead directions.
         """
-        try:
-            # Correct field name for the NetCDF-style SOFA object.
-            source_positions = np.asarray(self.sofa.SourcePosition)
 
-            if source_positions.ndim == 1:
-                source_positions = source_positions.reshape(1, -1)
+        source_positions = np.asarray(
+            self.sofa.SourcePosition,
+            dtype=float,
+        )
 
-            sofa_azimuths = source_positions[:, 0]
-
-            requested_azimuth = float(azimuth_deg) % 360.0
-
-            angle_difference = np.abs(
-                (sofa_azimuths - requested_azimuth + 180.0) % 360.0
-                - 180.0
-            )
-
-            nearest_index = int(np.argmin(angle_difference))
-
-            return nearest_index
-
-        except Exception as error:
-            print(f"Could not find nearest HRTF: {error}")
-            return 0
-
-    def create_warning_sound(self, azimuth_deg=0.0, duration=0.5):
-        """
-        Create a warning sound spatialized using the HRTF impulse response.
-        """
-        try:
-            duration = float(duration)
-
-            if duration <= 0:
-                duration = 0.5
-
-            frequency_1 = 700.0
-            frequency_2 = 1050.0
-
-            sample_count = int(self.sample_rate * duration)
-
-            time_axis = np.arange(sample_count) / self.sample_rate
-
-            # Warning tone.
-            tone = (
-                0.65 * np.sin(2.0 * np.pi * frequency_1 * time_axis)
-                + 0.35 * np.sin(2.0 * np.pi * frequency_2 * time_axis)
-            )
-
-            # Fade-in and fade-out to avoid clicking sounds.
-            fade_length = min(
-                int(self.sample_rate * 0.03),
-                max(1, sample_count // 2),
-            )
-
-            envelope = np.ones(sample_count)
-
-            envelope[:fade_length] = np.linspace(
-                0.0,
-                1.0,
-                fade_length,
-            )
-
-            envelope[-fade_length:] = np.linspace(
-                1.0,
-                0.0,
-                fade_length,
-            )
-
-            tone = tone * envelope
-
-            hrtf_index = self.find_nearest_hrtf(azimuth_deg)
-
-            # Correct HRTF impulse-response field name.
-            impulse_responses = np.asarray(self.sofa.Data_IR)
-
-            print(
-                f"HRTF IR shape: {impulse_responses.shape}"
-                if hrtf_index == 0
-                else "",
-                end="",
-            )
-
-            # Expected shape is normally:
-            # [measurement, receiver/ear, impulse-sample]
-            left_ir = np.asarray(
-                impulse_responses[hrtf_index, 0],
-                dtype=np.float64,
-            )
-
-            right_ir = np.asarray(
-                impulse_responses[hrtf_index, 1],
-                dtype=np.float64,
-            )
-
-            # Apply the HRTF to both ears.
-            left_audio = signal.fftconvolve(
-                tone,
-                left_ir,
-                mode="full",
-            )
-
-            right_audio = signal.fftconvolve(
-                tone,
-                right_ir,
-                mode="full",
-            )
-
-            output_length = min(
-                len(left_audio),
-                len(right_audio),
-            )
-
-            stereo_audio = np.column_stack(
-                (
-                    left_audio[:output_length],
-                    right_audio[:output_length],
+        if source_positions.ndim == 1:
+            source_positions = (
+                source_positions.reshape(
+                    1,
+                    -1,
                 )
             )
 
-            # Normalize to prevent clipping.
-            maximum = np.max(np.abs(stereo_audio))
+        sofa_azimuths = (
+            source_positions[:, 0]
+        )
 
-            if maximum > 0:
-                stereo_audio = stereo_audio / maximum
+        sofa_elevations = (
+            source_positions[:, 1]
+        )
 
-            # Convert to sounddevice-compatible format.
-            stereo_audio = stereo_audio.astype(np.float32)
+        requested = (
+            float(sofa_azimuth_deg)
+            % 360.0
+        )
 
-            # Increase the output level.
-            stereo_audio = stereo_audio * 0.85
+        # Circular angular difference.
+        az_difference = np.abs(
+            (
+                sofa_azimuths
+                - requested
+                + 180.0
+            )
+            % 360.0
+            - 180.0
+        )
 
-            return stereo_audio
+        # Prefer horizontal-plane measurements.
+        elevation_penalty = (
+            np.abs(sofa_elevations)
+            * 0.01
+        )
 
-        except Exception as error:
-            print(f"Could not create HRTF warning sound: {error}")
+        score = (
+            az_difference
+            + elevation_penalty
+        )
 
-            # Fallback stereo tone.
-            sample_count = int(self.sample_rate * duration)
-            time_axis = np.arange(sample_count) / self.sample_rate
+        index = int(
+            np.argmin(score)
+        )
 
-            fallback_tone = (
-                0.7
-                * np.sin(2.0 * np.pi * 700.0 * time_axis)
+        return (
+            index,
+            float(
+                sofa_azimuths[index]
+            ),
+            float(
+                sofa_elevations[index]
+            ),
+        )
+
+    # ======================================================
+    # SPATIALIZATION
+    # ======================================================
+
+    def _spatialize(
+        self,
+        tone: np.ndarray,
+        physical_azimuth_deg: float,
+        level: float,
+    ):
+        """Convolve a mono signal with the correct HRTF.
+
+        physical_azimuth_deg is ALWAYS in project convention.
+
+        Conversion to SOFA convention happens here and nowhere
+        else in the application.
+        """
+
+        sofa_azimuth_deg = (
+            self.physical_to_sofa_azimuth(
+                physical_azimuth_deg
+            )
+        )
+
+        (
+            hrtf_index,
+            used_sofa_azimuth,
+            used_elevation,
+        ) = self.find_nearest_hrtf(
+            sofa_azimuth_deg
+        )
+
+        ir = np.asarray(
+            self.sofa.Data_IR
+        )
+
+        left_ir = np.asarray(
+            ir[
+                hrtf_index,
+                0,
+            ],
+            dtype=np.float64,
+        )
+
+        right_ir = np.asarray(
+            ir[
+                hrtf_index,
+                1,
+            ],
+            dtype=np.float64,
+        )
+
+        # --------------------------------------------------
+        # HRTF convolution
+        # --------------------------------------------------
+
+        left = signal.fftconvolve(
+            tone,
+            left_ir,
+            mode="full",
+        )
+
+        right = signal.fftconvolve(
+            tone,
+            right_ir,
+            mode="full",
+        )
+
+        length = min(
+            len(left),
+            len(right),
+        )
+
+        stereo = np.column_stack(
+            (
+                left[:length],
+                right[:length],
+            )
+        )
+
+        # --------------------------------------------------
+        # Normalize
+        # --------------------------------------------------
+
+        maximum = float(
+            np.max(
+                np.abs(stereo)
+            )
+        )
+
+        if maximum > 0.0:
+            stereo /= maximum
+
+        # --------------------------------------------------
+        # Debug output
+        # --------------------------------------------------
+
+        print(
+            f"HRTF physical azimuth="
+            f"{physical_azimuth_deg:+.1f}°, "
+            f"SOFA azimuth="
+            f"{sofa_azimuth_deg:+.1f}°, "
+            f"using SOFA measurement="
+            f"{used_sofa_azimuth:+.1f}°, "
+            f"elevation="
+            f"{used_elevation:+.1f}°"
+        )
+
+        return (
+            stereo * level
+        ).astype(
+            np.float32
+        )
+
+    # ======================================================
+    # ENVELOPE
+    # ======================================================
+
+    @staticmethod
+    def _envelope(
+        sample_rate,
+        sample_count,
+        fade_s=0.025,
+    ):
+        fade = min(
+            int(
+                sample_rate
+                * fade_s
+            ),
+            max(
+                1,
+                sample_count // 2,
+            ),
+        )
+
+        envelope = np.ones(
+            sample_count
+        )
+
+        envelope[:fade] = (
+            np.linspace(
+                0.0,
+                1.0,
+                fade,
+            )
+        )
+
+        envelope[-fade:] = (
+            np.linspace(
+                1.0,
+                0.0,
+                fade,
+            )
+        )
+
+        return envelope
+
+    # ======================================================
+    # URGENT WARNING SOUND
+    # ======================================================
+
+    def create_warning_sound(
+        self,
+        azimuth_deg=0.0,
+        duration=0.5,
+    ):
+        """Create the loud urgent hazard cue.
+
+        azimuth_deg uses the PROJECT physical convention.
+        """
+
+        try:
+            sample_count = int(
+                self.sample_rate
+                * max(
+                    float(duration),
+                    0.1,
+                )
             )
 
-            fallback_tone = fallback_tone.astype(np.float32)
+            t = (
+                np.arange(
+                    sample_count
+                )
+                / self.sample_rate
+            )
+
+            tone = (
+                0.65
+                * np.sin(
+                    2
+                    * np.pi
+                    * 700
+                    * t
+                )
+                + 0.35
+                * np.sin(
+                    2
+                    * np.pi
+                    * 1050
+                    * t
+                )
+            )
+
+            tone *= self._envelope(
+                self.sample_rate,
+                sample_count,
+                0.03,
+            )
+
+            return self._spatialize(
+                tone,
+                azimuth_deg,
+                0.85,
+            )
+
+        except Exception as error:
+
+            print(
+                f"Could not create HRTF "
+                f"warning sound: {error}"
+            )
+
+            # Safe fallback: centered stereo.
+            sample_count = int(
+                self.sample_rate
+                * 0.5
+            )
+
+            t = (
+                np.arange(
+                    sample_count
+                )
+                / self.sample_rate
+            )
+
+            fallback = (
+                0.7
+                * np.sin(
+                    2
+                    * np.pi
+                    * 700
+                    * t
+                )
+            ).astype(
+                np.float32
+            )
 
             return np.column_stack(
                 (
-                    fallback_tone,
-                    fallback_tone,
+                    fallback,
+                    fallback,
                 )
             )
 
+    # ======================================================
+    # SOFT PATH GUIDANCE SOUND
+    # ======================================================
 
-    def create_path_guidance_sound(self, azimuth_deg=0.0, duration=0.22):
+    def create_path_guidance_sound(
+        self,
+        azimuth_deg=0.0,
+        duration=0.45,
+    ):
+        """Create a softer route-direction cue.
+
+        azimuth_deg uses the PROJECT physical convention.
+
+        Therefore:
+            -30° = LEFT
+             0° = AHEAD
+            +30° = RIGHT
         """
-        Create a softer, shorter HRTF cue for navigation guidance.
 
-        This is intentionally different from the urgent hazard beep:
-        - shorter duration
-        - lower amplitude
-        - lower, softer two-tone cue
-
-        The azimuth is still spatialized through the same HRTF.
-        """
         try:
-            duration = max(float(duration), 0.08)
+            sample_count = int(
+                self.sample_rate
+                * max(
+                    float(duration),
+                    0.15,
+                )
+            )
 
-            frequency_1 = 420.0
-            frequency_2 = 620.0
-            sample_count = int(self.sample_rate * duration)
-            time_axis = np.arange(sample_count) / self.sample_rate
+            t = (
+                np.arange(
+                    sample_count
+                )
+                / self.sample_rate
+            )
 
             tone = (
-                0.60 * np.sin(2.0 * np.pi * frequency_1 * time_axis)
-                + 0.40 * np.sin(2.0 * np.pi * frequency_2 * time_axis)
+                0.60
+                * np.sin(
+                    2
+                    * np.pi
+                    * 420
+                    * t
+                )
+                + 0.40
+                * np.sin(
+                    2
+                    * np.pi
+                    * 620
+                    * t
+                )
             )
 
-            fade_length = min(
-                int(self.sample_rate * 0.025),
-                max(1, sample_count // 2),
-            )
-            envelope = np.ones(sample_count)
-            envelope[:fade_length] = np.linspace(0.0, 1.0, fade_length)
-            envelope[-fade_length:] = np.linspace(1.0, 0.0, fade_length)
-            tone *= envelope
-
-            hrtf_index = self.find_nearest_hrtf(azimuth_deg)
-            impulse_responses = np.asarray(self.sofa.Data_IR)
-
-            left_ir = np.asarray(impulse_responses[hrtf_index, 0], dtype=np.float64)
-            right_ir = np.asarray(impulse_responses[hrtf_index, 1], dtype=np.float64)
-
-            left_audio = signal.fftconvolve(tone, left_ir, mode="full")
-            right_audio = signal.fftconvolve(tone, right_ir, mode="full")
-
-            output_length = min(len(left_audio), len(right_audio))
-            stereo_audio = np.column_stack(
-                (left_audio[:output_length], right_audio[:output_length])
+            tone *= self._envelope(
+                self.sample_rate,
+                sample_count,
+                0.03,
             )
 
-            maximum = np.max(np.abs(stereo_audio))
-            if maximum > 0:
-                stereo_audio /= maximum
-
-            # Much quieter than the urgent warning.
-            stereo_audio = (stereo_audio * 0.28).astype(np.float32)
-            return stereo_audio
+            return self._spatialize(
+                tone,
+                azimuth_deg,
+                0.50,
+            )
 
         except Exception as error:
-            print(f"Could not create path guidance sound: {error}")
-            sample_count = int(self.sample_rate * max(float(duration), 0.08))
-            time_axis = np.arange(sample_count) / self.sample_rate
+
+            print(
+                f"Could not create path "
+                f"guidance sound: {error}"
+            )
+
+            sample_count = int(
+                self.sample_rate
+                * 0.45
+            )
+
+            t = (
+                np.arange(
+                    sample_count
+                )
+                / self.sample_rate
+            )
+
             fallback = (
-                0.28
-                * 0.5
-                * np.sin(2.0 * np.pi * 500.0 * time_axis)
-            ).astype(np.float32)
-            return np.column_stack((fallback, fallback))
-
-    def play_path_guidance(self, azimuth_deg=0.0, force=False):
-        """
-        Play the softer navigation/path-guidance cue.
-
-        This has its own cooldown so path guidance does not interfere
-        with the urgent-warning cooldown.
-        """
-        current_time = time.monotonic()
-
-        if not force:
-            elapsed_time = current_time - self.last_path_guidance_time
-            if elapsed_time < self.path_guidance_cooldown:
-                return False
-
-        try:
-            audio = self.create_path_guidance_sound(
-                azimuth_deg=azimuth_deg,
-                duration=0.22,
+                0.35
+                * np.sin(
+                    2
+                    * np.pi
+                    * 500
+                    * t
+                )
+            ).astype(
+                np.float32
             )
 
-            if audio is None or len(audio) == 0:
-                return False
+            return np.column_stack(
+                (
+                    fallback,
+                    fallback,
+                )
+            )
+
+    # ======================================================
+    # PLAY URGENT WARNING
+    # ======================================================
+
+    def play_warning(
+        self,
+        azimuth_deg=0.0,
+        force=False,
+    ):
+        """Play an urgent warning from the obstacle's direction.
+
+        azimuth_deg uses the PROJECT physical convention.
+        """
+
+        now = time.monotonic()
+
+        if (
+            not force
+            and (
+                now
+                - self.last_warning_time
+            )
+            < self.warning_cooldown
+        ):
+            return False
+
+        try:
+            audio = (
+                self.create_warning_sound(
+                    azimuth_deg,
+                    0.5,
+                )
+            )
 
             print(
-                f"Playing soft path-guidance cue at "
-                f"{azimuth_deg:.1f} degrees"
+                "Playing URGENT HRTF warning "
+                f"at physical "
+                f"{azimuth_deg:+.1f}°"
             )
 
             sd.play(
@@ -352,45 +699,61 @@ class HRTFRenderer:
                 blocking=True,
             )
 
-            self.last_path_guidance_time = time.monotonic()
+            self.last_warning_time = (
+                time.monotonic()
+            )
+
             return True
 
         except Exception as error:
-            print(f"Could not play path guidance sound: {error}")
-            return False
-
-    def play_warning(self, azimuth_deg=0.0, force=False):
-        """
-        Play a warning sound.
-
-        Playback is blocking to ensure that the warning is not lost
-        or interrupted by the video-processing loop.
-        """
-        current_time = time.monotonic()
-
-        if not force:
-            elapsed_time = current_time - self.last_warning_time
-
-            if elapsed_time < self.warning_cooldown:
-                return False
-
-        try:
-            audio = self.create_warning_sound(
-                azimuth_deg=azimuth_deg,
-                duration=0.5,
-            )
-
-            if audio is None or len(audio) == 0:
-                print("Warning audio could not be generated.")
-                return False
 
             print(
-                f"Playing HRTF warning at "
-                f"{azimuth_deg:.1f} degrees"
+                f"Could not play warning "
+                f"sound: {error}"
             )
 
-            # Blocking playback guarantees that the warning is sent
-            # completely to the selected output device.
+            return False
+
+    # ======================================================
+    # PLAY PATH GUIDANCE
+    # ======================================================
+
+    def play_path_guidance(
+        self,
+        azimuth_deg=0.0,
+        force=False,
+    ):
+        """Play a soft cue toward the recommended walking direction.
+
+        azimuth_deg uses the PROJECT physical convention.
+        """
+
+        now = time.monotonic()
+
+        if (
+            not force
+            and (
+                now
+                - self.last_path_guidance_time
+            )
+            < self.path_guidance_cooldown
+        ):
+            return False
+
+        try:
+            audio = (
+                self.create_path_guidance_sound(
+                    azimuth_deg,
+                    0.45,
+                )
+            )
+
+            print(
+                "Playing SOFT path-guidance "
+                "cue toward physical "
+                f"{azimuth_deg:+.1f}°"
+            )
+
             sd.play(
                 audio,
                 samplerate=self.sample_rate,
@@ -398,25 +761,39 @@ class HRTFRenderer:
                 blocking=True,
             )
 
-            self.last_warning_time = time.monotonic()
+            self.last_path_guidance_time = (
+                time.monotonic()
+            )
 
             return True
 
         except Exception as error:
-            print(f"Could not play warning sound: {error}")
+
+            print(
+                f"Could not play path "
+                f"guidance sound: {error}"
+            )
+
             return False
+
+    # ======================================================
+    # STOP / CLOSE
+    # ======================================================
 
     def stop(self):
-        """
-        Stop currently playing audio.
-        """
+        """Stop currently playing audio."""
+
         try:
             sd.stop()
+
         except Exception as error:
-            print(f"Could not stop audio: {error}")
+
+            print(
+                f"Could not stop audio: "
+                f"{error}"
+            )
 
     def close(self):
-        """
-        Close the renderer and stop audio.
-        """
+        """Stop and close the renderer."""
+
         self.stop()

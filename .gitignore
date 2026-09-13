@@ -45,3 +45,4 @@ output_memory*.json
 videos/*_navigation.json
 videos/results.csv
 videos/labels.jpg.jpeg
+videos/*_navigation*.json

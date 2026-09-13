@@ -27,11 +27,57 @@ class Detection:
 
     @property
     def distance(self) -> float:
-        return hypot(self.relative_x, self.relative_y)
+        """Approximate distance from the camera/user."""
+        return hypot(
+            self.relative_x,
+            self.relative_y,
+        )
 
     @property
     def azimuth_deg(self) -> float:
-        return degrees(atan2(self.relative_x, self.relative_y))
+        """Physical camera-relative azimuth.
+
+        Project convention:
+            negative = left
+            0       = straight ahead
+            positive = right
+        """
+        return degrees(
+            atan2(
+                self.relative_x,
+                self.relative_y,
+            )
+        )
+
+    @property
+    def audio_azimuth_deg(self) -> float:
+        """Perceptually expanded PHYSICAL azimuth for HRTF audio.
+
+        Important:
+            This property keeps the same physical convention as
+            azimuth_deg.
+
+            negative = left
+            0       = ahead
+            positive = right
+
+        The conversion from this physical convention to the
+        SOFA/MIT-KEMAR convention is performed ONLY inside
+        HRTFRenderer.
+
+        This prevents the urgent-warning and path-guidance
+        branches from using different coordinate conventions.
+        """
+
+        expanded = self.azimuth_deg * 2.5
+
+        return max(
+            -90.0,
+            min(
+                90.0,
+                expanded,
+            ),
+        )
 
 
 @dataclass(frozen=True)
@@ -40,21 +86,9 @@ class FramePacket:
     timestamp: float
     image: ImageArray
 
+
 @dataclass(frozen=True)
 class Pose:
-    """
-    Where the person/robot is in the world, at one point in time.
-
-    For tomorrow's demo this is produced by `navigation.sensing.SimulatedSensor`
-    (a fixed, hand-authored walking path). Later it will be produced by a real
-    SLAM system instead:
-
-        RealSense RGB-D + IMU -> RTAB-Map / ORB-SLAM3 -> Pose
-
-    Nothing downstream (this class included) needs to know or care which of
-    those two produced it - that's the whole point of having this type.
-    """
-
     x: float
     y: float
     heading_deg: float
@@ -72,3 +106,5 @@ class WarningEvent:
     score: float
     motion: str
     reason: str
+    category: str
+    ttc_s: float | None = None
