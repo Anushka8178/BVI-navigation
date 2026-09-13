@@ -25,6 +25,8 @@ class HRTFRenderer:
 
         self.warning_cooldown = float(warning_cooldown)
         self.last_warning_time = 0.0
+        self.path_guidance_cooldown = 1.2
+        self.last_path_guidance_time = 0.0
 
         self.device = output_device
 
@@ -247,6 +249,115 @@ class HRTFRenderer:
                     fallback_tone,
                 )
             )
+
+
+    def create_path_guidance_sound(self, azimuth_deg=0.0, duration=0.22):
+        """
+        Create a softer, shorter HRTF cue for navigation guidance.
+
+        This is intentionally different from the urgent hazard beep:
+        - shorter duration
+        - lower amplitude
+        - lower, softer two-tone cue
+
+        The azimuth is still spatialized through the same HRTF.
+        """
+        try:
+            duration = max(float(duration), 0.08)
+
+            frequency_1 = 420.0
+            frequency_2 = 620.0
+            sample_count = int(self.sample_rate * duration)
+            time_axis = np.arange(sample_count) / self.sample_rate
+
+            tone = (
+                0.60 * np.sin(2.0 * np.pi * frequency_1 * time_axis)
+                + 0.40 * np.sin(2.0 * np.pi * frequency_2 * time_axis)
+            )
+
+            fade_length = min(
+                int(self.sample_rate * 0.025),
+                max(1, sample_count // 2),
+            )
+            envelope = np.ones(sample_count)
+            envelope[:fade_length] = np.linspace(0.0, 1.0, fade_length)
+            envelope[-fade_length:] = np.linspace(1.0, 0.0, fade_length)
+            tone *= envelope
+
+            hrtf_index = self.find_nearest_hrtf(azimuth_deg)
+            impulse_responses = np.asarray(self.sofa.Data_IR)
+
+            left_ir = np.asarray(impulse_responses[hrtf_index, 0], dtype=np.float64)
+            right_ir = np.asarray(impulse_responses[hrtf_index, 1], dtype=np.float64)
+
+            left_audio = signal.fftconvolve(tone, left_ir, mode="full")
+            right_audio = signal.fftconvolve(tone, right_ir, mode="full")
+
+            output_length = min(len(left_audio), len(right_audio))
+            stereo_audio = np.column_stack(
+                (left_audio[:output_length], right_audio[:output_length])
+            )
+
+            maximum = np.max(np.abs(stereo_audio))
+            if maximum > 0:
+                stereo_audio /= maximum
+
+            # Much quieter than the urgent warning.
+            stereo_audio = (stereo_audio * 0.28).astype(np.float32)
+            return stereo_audio
+
+        except Exception as error:
+            print(f"Could not create path guidance sound: {error}")
+            sample_count = int(self.sample_rate * max(float(duration), 0.08))
+            time_axis = np.arange(sample_count) / self.sample_rate
+            fallback = (
+                0.28
+                * 0.5
+                * np.sin(2.0 * np.pi * 500.0 * time_axis)
+            ).astype(np.float32)
+            return np.column_stack((fallback, fallback))
+
+    def play_path_guidance(self, azimuth_deg=0.0, force=False):
+        """
+        Play the softer navigation/path-guidance cue.
+
+        This has its own cooldown so path guidance does not interfere
+        with the urgent-warning cooldown.
+        """
+        current_time = time.monotonic()
+
+        if not force:
+            elapsed_time = current_time - self.last_path_guidance_time
+            if elapsed_time < self.path_guidance_cooldown:
+                return False
+
+        try:
+            audio = self.create_path_guidance_sound(
+                azimuth_deg=azimuth_deg,
+                duration=0.22,
+            )
+
+            if audio is None or len(audio) == 0:
+                return False
+
+            print(
+                f"Playing soft path-guidance cue at "
+                f"{azimuth_deg:.1f} degrees"
+            )
+
+            sd.play(
+                audio,
+                samplerate=self.sample_rate,
+                device=self.device,
+                blocking=True,
+            )
+
+            self.last_path_guidance_time = time.monotonic()
+            return True
+
+        except Exception as error:
+            print(f"Could not play path guidance sound: {error}")
+            return False
 
     def play_warning(self, azimuth_deg=0.0, force=False):
         """
