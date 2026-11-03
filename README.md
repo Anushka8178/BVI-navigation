@@ -48,11 +48,13 @@ python main.py
 > scoring + simulated SLAM + persistent memory, on a recorded video — see
 > below).
 
-Run the tests:
+Run the tests (all automated tests live in `tests/`; no camera, phone, GPU or audio device needed):
 
-```bash
-python -m unittest discover -s tests -v
+```powershell
+python -m pytest -q
 ```
+
+Manual audio/device/video checks live in `scripts/manual/` (see its README) and are not run by pytest.
 
 The program runs a deterministic six-frame walking scenario and prints detections, urgent bypass alerts, memory contents, top-k acoustic attention, and route explanations. Its database is created at `data/navigation.db`.
 

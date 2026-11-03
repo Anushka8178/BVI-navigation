@@ -46,3 +46,7 @@ videos/*_navigation.json
 videos/results.csv
 videos/labels.jpg.jpeg
 videos/*_navigation*.json
+# Generated run reports (demo outputs)
+videos/*_annotated*.json
+/output*.json
+evaluation_*.json
