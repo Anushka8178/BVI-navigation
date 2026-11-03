@@ -42,26 +42,12 @@ from navigation.memory import RouteMemory
 from navigation.models import FramePacket, Pose
 from navigation.planner import LocalPathPlanner
 from navigation.reasoning import AcousticAttention
-from navigation.sensing import localize_detection
+from navigation.sensing import localize_detection, simulated_pose
 from navigation.trajectory import HazardTrajectoryTracker
 from navigation.yolo_perception import YOLOPerception
 
 
 ImageArray = NDArray[np.uint8]
-
-
-def simulated_pose(timestamp: float) -> Pose:
-    """Deterministic simulated walking pose used instead of real SLAM."""
-    walking_speed_m_s = 0.5
-    lateral_drift_m_s = 0.05
-    turn_rate_deg_s = 1.0
-
-    return Pose(
-        x=walking_speed_m_s * timestamp,
-        y=lateral_drift_m_s * timestamp,
-        heading_deg=turn_rate_deg_s * timestamp,
-        timestamp=timestamp,
-    )
 
 
 def create_writer(

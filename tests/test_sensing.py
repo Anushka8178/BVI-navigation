@@ -50,14 +50,15 @@ def test_local_to_world_rotates_with_heading() -> None:
 
     world = local_to_world(pose, detection)
 
-    # A 90 degree heading rotates the local +x axis onto the world +y axis.
+    # Heading 90 (clockwise) faces world +x, so the user's right (local +x)
+    # points along world -y.
     assert isclose(world.x, 0.0, abs_tol=1e-9)
-    assert isclose(world.y, 1.0, abs_tol=1e-9)
+    assert isclose(world.y, -1.0, abs_tol=1e-9)
 
 
 def test_localize_detection_matches_local_to_world() -> None:
     sensor = SimulatedSensor()
-    pose = sensor.get_pose(4)  # x=1.5, y=0.1, heading=5.0, t=3.0
+    pose = sensor.get_pose(4)  # x=0.1, y=1.5, heading=5.0, t=3.0
     detection = create_detection(relative_x=1.0, relative_y=0.5)
 
     world = local_to_world(pose, detection)
@@ -66,9 +67,9 @@ def test_localize_detection_matches_local_to_world() -> None:
     assert isinstance(localized, LocalizedDetection)
     assert isclose(localized.world_x, world.x)
     assert isclose(localized.world_y, world.y)
-    # Frame 4 hazard example: world position is roughly (2.45, 0.69).
-    assert isclose(localized.world_x, 2.45, abs_tol=0.01)
-    assert isclose(localized.world_y, 0.69, abs_tol=0.01)
+    # Frame 4 hazard example: world position is roughly (1.14, 1.91).
+    assert isclose(localized.world_x, 1.14, abs_tol=0.01)
+    assert isclose(localized.world_y, 1.91, abs_tol=0.01)
 
 
 def test_localize_detection_carries_handoff_metadata() -> None:

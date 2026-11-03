@@ -88,7 +88,7 @@ SimulatedSensor -> Pose -> Detection -> local_to_world() -> WorldPoint
 ```
 
 - `SimulatedSensor` emits six fixed, deterministic `Pose` objects (no camera, no IMU) standing in for a future real SLAM system (RealSense RGB-D + IMU -> RTAB-Map/ORB-SLAM3 -> `Pose`). Nothing downstream needs to change when that swap happens.
-- `local_to_world(pose, detection)` rotates and translates a detection's camera-relative `(relative_x, relative_y)` by the current pose's heading and position, producing a `WorldPoint(x, y)`. Heading 0° means the robot's +x direction.
+- `local_to_world(pose, detection)` rotates and translates a detection's camera-relative `(relative_x, relative_y)` by the current pose's heading and position, producing a `WorldPoint(x, y)`. Heading is measured clockwise from world +y (heading 0° = forward, 90° = facing +x/right), so forward = (sin h, cos h).
 - `localize_detection(pose, detection)` is the actual handoff function: it calls `local_to_world()` and bundles the result with the detection's id, label, confidence, motion, and the pose's timestamp into a `LocalizedDetection`, ready for `navigation/memory.py` (not yet implemented) to consume, e.g. `memory.save(localized)`.
 
 Run the localization-only demo (no OpenCV/YOLO required):

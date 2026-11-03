@@ -24,6 +24,12 @@ a fixed, hand-written list of six Pose objects. There is no camera, no IMU,
 and no actual SLAM math - just deterministic numbers, so every run of the demo
 (and every re-run of the tests) produces identical output.
 
+Frame convention (see CLAUDE.md):
+    world x = right of the start heading, world y = forward at the start (m).
+    heading = degrees CLOCKWISE from +y, so forward = (sin h, cos h) and
+    right = (cos h, -sin h). Detections use relative_x = right,
+    relative_y = forward.
+
 `local_to_world()` is the other half of the localization contract: given the
 current Pose and a Detection (which is expressed relative to the camera),
 it produces the position that persistent memory should actually store.
@@ -42,19 +48,19 @@ class SimulatedSensor:
     """
     Deterministic stand-in for real SLAM.
 
-    Represents a person walking a few steps roughly forward with a slight
-    rightward drift and turn. Call `get_poses()` to get all six poses at
+    Represents a person walking a few steps forward (+y at heading 0) with a
+    slight rightward drift (+x) and a slight right (clockwise) turn. Call `get_poses()` to get all six poses at
     once, or `get_pose(frame_id)` to get just one (frame_id is 1-based, the
     same convention `FramePacket.frame_id` already uses elsewhere).
     """
 
     _POSES: tuple[Pose, ...] = (
         Pose(x=0.0, y=0.0, heading_deg=0.0, timestamp=0.0),
-        Pose(x=0.5, y=0.0, heading_deg=0.0, timestamp=1.0),
-        Pose(x=1.0, y=0.0, heading_deg=0.0, timestamp=2.0),
-        Pose(x=1.5, y=0.1, heading_deg=5.0, timestamp=3.0),
-        Pose(x=2.0, y=0.2, heading_deg=5.0, timestamp=4.0),
-        Pose(x=2.5, y=0.3, heading_deg=10.0, timestamp=5.0),
+        Pose(x=0.0, y=0.5, heading_deg=0.0, timestamp=1.0),
+        Pose(x=0.0, y=1.0, heading_deg=0.0, timestamp=2.0),
+        Pose(x=0.1, y=1.5, heading_deg=5.0, timestamp=3.0),
+        Pose(x=0.2, y=2.0, heading_deg=5.0, timestamp=4.0),
+        Pose(x=0.3, y=2.5, heading_deg=10.0, timestamp=5.0),
     )
 
     def get_poses(self) -> list[Pose]:
@@ -91,11 +97,54 @@ def local_to_world(pose: Pose, detection: Detection) -> WorldPoint:
     using the current Pose.
     """
     theta = radians(pose.heading_deg)
+    rx, ry = detection.relative_x, detection.relative_y
 
-    world_x = pose.x + detection.relative_x * cos(theta) - detection.relative_y * sin(theta)
-    world_y = pose.y + detection.relative_x * sin(theta) + detection.relative_y * cos(theta)
+    # Heading is clockwise from +y: forward = (sin h, cos h), right = (cos h, -sin h).
+    world_x = pose.x + rx * cos(theta) + ry * sin(theta)
+    world_y = pose.y - rx * sin(theta) + ry * cos(theta)
 
     return WorldPoint(world_x, world_y)
+
+
+def world_to_local(pose: Pose, world_x: float, world_y: float) -> tuple[float, float]:
+    """Inverse of `local_to_world()`: world point -> (relative_x, relative_y).
+
+    relative_x = right of the user (m), relative_y = ahead of the user (m).
+    """
+    theta = radians(pose.heading_deg)
+    dx, dy = world_x - pose.x, world_y - pose.y
+
+    relative_x = dx * cos(theta) - dy * sin(theta)
+    relative_y = dx * sin(theta) + dy * cos(theta)
+
+    return relative_x, relative_y
+
+
+def simulated_pose(
+    timestamp: float,
+    walking_speed_m_s: float = 0.5,
+    lateral_drift_m_s: float = 0.05,
+    turn_rate_deg_s: float = 1.0,
+) -> Pose:
+    """Deterministic simulated walking pose used instead of real SLAM.
+
+    The user walks FORWARD along the current heading, drifts slightly to
+    their right, and turns slowly clockwise (to the right). Position is the
+    exact integral of that motion, so it always agrees with the heading.
+    """
+    heading_deg = turn_rate_deg_s * timestamp
+    h = radians(heading_deg)
+    omega = radians(turn_rate_deg_s)
+
+    if abs(omega) < 1e-9:
+        x = lateral_drift_m_s * timestamp
+        y = walking_speed_m_s * timestamp
+    else:
+        # Integral of v*(sin wt, cos wt) + d*(cos wt, -sin wt) from 0 to t.
+        x = (walking_speed_m_s * (1.0 - cos(h)) + lateral_drift_m_s * sin(h)) / omega
+        y = (walking_speed_m_s * sin(h) + lateral_drift_m_s * (cos(h) - 1.0)) / omega
+
+    return Pose(x=x, y=y, heading_deg=heading_deg, timestamp=timestamp)
 
 
 @dataclass(frozen=True)
