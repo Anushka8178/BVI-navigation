@@ -100,6 +100,7 @@ def test_pipeline_emits_warning() -> None:
     pipeline = NavigationPipeline(
         perception=FakePerception(),
         severity=HazardSeverityClassifier(),
+        audio_enabled=False,
     )
 
     # Tests must provide an actual image array,
@@ -122,3 +123,53 @@ def test_pipeline_emits_warning() -> None:
     assert result.detection_count == 1
     assert len(result.warnings) == 1
     assert result.warnings[0].label == "person"
+
+def make_frame() -> FramePacket:
+    return FramePacket(
+        frame_id=1,
+        timestamp=0.0,
+        image=np.zeros((100, 100, 3), dtype=np.uint8),
+    )
+
+
+def test_pipeline_no_audio_has_no_renderer() -> None:
+    pipeline = NavigationPipeline(
+        perception=FakePerception(),
+        severity=HazardSeverityClassifier(),
+        audio_enabled=False,
+    )
+
+    assert pipeline.hrtf_renderer is None
+
+    result = pipeline.process_cycle(make_frame())
+
+    assert len(result.warnings) == 1
+    pipeline.close()  # no-op without audio
+
+
+def test_pipeline_plays_warning_on_injected_renderer() -> None:
+    class FakeRenderer:
+        def __init__(self) -> None:
+            self.azimuths: list[float] = []
+            self.closed = False
+
+        def play_warning(self, azimuth_deg: float) -> bool:
+            self.azimuths.append(azimuth_deg)
+            return True
+
+        def close(self) -> None:
+            self.closed = True
+
+    renderer = FakeRenderer()
+    pipeline = NavigationPipeline(
+        perception=FakePerception(),
+        severity=HazardSeverityClassifier(),
+        audio_enabled=False,  # injected renderer still wins
+        hrtf_renderer=renderer,
+    )
+
+    result = pipeline.process_cycle(make_frame())
+
+    assert renderer.azimuths == [result.warnings[0].azimuth_deg]
+    pipeline.close()
+    assert renderer.closed

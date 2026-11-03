@@ -173,6 +173,19 @@ def main() -> None:
         help="Process without opening a video window",
     )
 
+    parser.add_argument(
+        "--audio-device",
+        default=None,
+        help="Audio output device index or name "
+        "(default: wired headphones, Bluetooth last)",
+    )
+
+    parser.add_argument(
+        "--no-audio",
+        action="store_true",
+        help="Disable HRTF audio (warnings are still shown)",
+    )
+
     args = parser.parse_args()
 
     if not args.weights.exists():
@@ -238,10 +251,15 @@ def main() -> None:
         device=args.device,
     )
 
-    pipeline = NavigationPipeline(
-        perception=perception,
-        severity=HazardSeverityClassifier(),
-    )
+    try:
+        pipeline = NavigationPipeline(
+            perception=perception,
+            severity=HazardSeverityClassifier(),
+            audio_enabled=not args.no_audio,
+            audio_device=args.audio_device,
+        )
+    except RuntimeError as error:
+        raise SystemExit(f"Audio setup failed: {error}")
 
     frame_id = 0
     warning_frames = 0
@@ -372,6 +390,7 @@ def main() -> None:
         capture.release()
         writer.release()
         cv2.destroyAllWindows()
+        pipeline.close()
 
     processing_seconds = (
         time.perf_counter()

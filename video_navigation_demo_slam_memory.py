@@ -229,7 +229,8 @@ def main() -> None:
     parser.add_argument(
         "--audio-device",
         default=None,
-        help="sounddevice output device index or name",
+        help="Audio output device index or name "
+        "(default: wired headphones, Bluetooth last)",
     )
     parser.add_argument(
         "--no-audio",
@@ -327,17 +328,13 @@ def main() -> None:
     if not args.no_audio:
         print("Initializing HRTF spatial audio...")
 
-        audio_device = args.audio_device
-        if audio_device is not None:
-            try:
-                audio_device = int(audio_device)
-            except ValueError:
-                pass
-
-        hrtf_renderer = HRTFRenderer(
-            sofa_path=str(args.hrtf),
-            output_device=audio_device,
-        )
+        try:
+            hrtf_renderer = HRTFRenderer(
+                sofa_path=str(args.hrtf),
+                output_device=args.audio_device,
+            )
+        except RuntimeError as error:
+            raise SystemExit(f"Audio setup failed: {error}")
         print("HRTF spatial audio initialized.\n")
     else:
         print("HRTF spatial audio disabled.\n")

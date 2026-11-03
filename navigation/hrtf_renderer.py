@@ -12,6 +12,136 @@ from scipy import signal
 URGENT = "urgent"
 SOFT = "soft"
 
+# Name fragments that mark an output as Bluetooth. Bluetooth adds about
+# 100-250 ms of latency, so it is only used when nothing else exists.
+# Windows lists Bluetooth earbuds as e.g. "Headphones (OPPO Enco Buds2)"
+# or "Headset (... Hands-Free AG Audio)", so these win over HEADPHONE_KEYWORDS.
+BLUETOOTH_KEYWORDS = (
+    "bluetooth",
+    "hands-free",
+    "handsfree",
+    "a2dp",
+    "airpods",
+    "buds",
+    "enco",
+)
+
+# Name fragments that suggest wired headphones / earphones.
+HEADPHONE_KEYWORDS = (
+    "headphone",
+    "earphone",
+    "headset",
+)
+
+
+def is_bluetooth_name(name: str) -> bool:
+    lowered = name.lower()
+    return any(keyword in lowered for keyword in BLUETOOTH_KEYWORDS)
+
+
+def _is_output(device) -> bool:
+    return int(device.get("max_output_channels", 0)) > 0
+
+
+def _is_raw_host_api(device) -> bool:
+    # "hostapi_name" is added by HRTFRenderer.find_output_device.
+    return "wdm-ks" in str(device.get("hostapi_name", "")).lower()
+
+
+def choose_output_device(devices, default_output=None, requested=None):
+    """Pick an output device index from sounddevice-style device dicts.
+
+    requested:
+        None        -> automatic choice (see below)
+        int or "3"  -> that device index (must be an output device)
+        other str   -> first output device whose name contains it
+                       (case-insensitive)
+
+    Automatic choice, in order:
+        1. wired headphones / earphones (headphone name, not Bluetooth)
+        2. the system default output, if it is not Bluetooth
+        3. any non-Bluetooth output device
+        4. a Bluetooth device (with a latency warning)
+
+    Returns (index, reason). Raises ValueError if a requested device
+    does not exist or has no outputs, and RuntimeError if there are no
+    output devices at all.
+    """
+
+    devices = list(devices)
+
+    if requested is not None:
+        text = str(requested).strip()
+
+        try:
+            index = int(text)
+        except ValueError:
+            index = None
+
+        if index is not None:
+            if not 0 <= index < len(devices):
+                raise ValueError(
+                    f"Audio device index {index} does not exist "
+                    f"(valid: 0-{len(devices) - 1})."
+                )
+            if not _is_output(devices[index]):
+                raise ValueError(
+                    f"Audio device {index} ({devices[index]['name']}) "
+                    "has no output channels."
+                )
+            return index, "requested by index"
+
+        needle = text.lower()
+        for index, device in enumerate(devices):
+            if _is_output(device) and needle in device["name"].lower():
+                return index, f"requested by name '{text}'"
+
+        raise ValueError(
+            f"No output audio device name contains '{text}'."
+        )
+
+    all_outputs = [
+        (index, device)
+        for index, device in enumerate(devices)
+        if _is_output(device)
+    ]
+
+    if not all_outputs:
+        raise RuntimeError("No audio output devices found.")
+
+    # Raw WDM-KS endpoints often fail to open or stay silent; only
+    # auto-pick one if nothing else exists (or if asked for by index).
+    outputs = [
+        (index, device)
+        for index, device in all_outputs
+        if not _is_raw_host_api(device)
+    ] or all_outputs
+
+    for index, device in outputs:
+        name = device["name"].lower()
+        if (
+            any(keyword in name for keyword in HEADPHONE_KEYWORDS)
+            and not is_bluetooth_name(name)
+        ):
+            return index, "wired headphones"
+
+    if (
+        default_output is not None
+        and 0 <= int(default_output) < len(devices)
+        and _is_output(devices[int(default_output)])
+        and not is_bluetooth_name(devices[int(default_output)]["name"])
+    ):
+        return int(default_output), "system default output"
+
+    for index, device in outputs:
+        if not is_bluetooth_name(device["name"]):
+            return index, "first non-Bluetooth output"
+
+    return outputs[0][0], (
+        "only Bluetooth outputs found - expect 100-250 ms extra latency; "
+        "use wired earphones"
+    )
+
 
 class SoundDeviceBackend:
     """Default output backend: plays through sounddevice.
@@ -135,15 +265,16 @@ class HRTFRenderer:
         # Output device
         # --------------------------------------------------
 
-        if not use_sounddevice and output_device is None:
+        if use_sounddevice:
+            # Resolves an index, a name or None (automatic) to an index.
+            self.device = self.find_output_device(output_device)
+        else:
             # Custom backends choose their own output.
-            output_device = "default"
-
-        self.device = (
-            output_device
-            if output_device is not None
-            else self.find_output_device()
-        )
+            self.device = (
+                output_device
+                if output_device is not None
+                else "default"
+            )
 
         print(
             f"HRTF sample rate: {self.sample_rate}"
@@ -191,85 +322,77 @@ class HRTFRenderer:
     # OUTPUT DEVICE
     # ======================================================
 
-    def find_output_device(self):
-        """Find a suitable headphone/output device."""
+    def find_output_device(self, requested=None):
+        """Choose the output device (see choose_output_device).
+
+        requested may be a device index, a numeric string, a name
+        fragment or None for automatic (wired headphones preferred,
+        Bluetooth last). Raises RuntimeError with a clear message if
+        the requested device cannot be used.
+        """
 
         sd = self.backend.sd
 
         try:
-            devices = sd.query_devices()
-
-            print("\nAvailable audio devices:")
-
-            for index, device in enumerate(
-                devices
-            ):
-                print(
-                    f"{index}: "
-                    f"{device['name']} | "
-                    f"inputs="
-                    f"{device['max_input_channels']} | "
-                    f"outputs="
-                    f"{device['max_output_channels']}"
+            hostapis = sd.query_hostapis()
+            devices = [
+                dict(
+                    device,
+                    hostapi_name=hostapis[device["hostapi"]]["name"],
                 )
-
-            preferred_keywords = [
-                "oppo",
-                "enco",
-                "bluetooth",
-                "headphone",
-                "headset",
-                "earbud",
+                for device in sd.query_devices()
             ]
-
-            for index, device in enumerate(
-                devices
-            ):
-                name = (
-                    device["name"]
-                    .lower()
-                )
-
-                if (
-                    device["max_output_channels"] > 0
-                    and any(
-                        keyword in name
-                        for keyword in preferred_keywords
-                    )
-                ):
-                    print(
-                        "Automatically selected "
-                        f"output device {index}"
-                    )
-
-                    return index
-
-            default_device = sd.default.device
-
-            if isinstance(
-                default_device,
-                (list, tuple),
-            ):
-                default_output = (
-                    default_device[1]
-                )
-            else:
-                default_output = default_device
-
-            print(
-                "Using default output device: "
-                f"{default_output}"
-            )
-
-            return default_output
-
         except Exception as error:
+            raise RuntimeError(
+                f"Could not list audio devices ({error}). "
+                "Run with --no-audio."
+            ) from error
+
+        print("\nAvailable audio devices:")
+
+        for index, device in enumerate(devices):
             print(
-                f"Could not find output device: "
-                f"{error}"
+                f"{index}: "
+                f"{device['name']} ({device['hostapi_name']}) | "
+                f"inputs="
+                f"{device['max_input_channels']} | "
+                f"outputs="
+                f"{device['max_output_channels']}"
             )
 
-            return None
+        # sd.default.device is an (input, output) pair-like object.
+        try:
+            default_output = int(sd.default.device[1])
+        except (TypeError, ValueError, IndexError):
+            default_output = None
+
+        if default_output is not None and default_output < 0:
+            default_output = None
+
+        try:
+            index, reason = choose_output_device(
+                devices,
+                default_output,
+                requested,
+            )
+        except (ValueError, RuntimeError) as error:
+            raise RuntimeError(
+                f"{error} Pick one from the list above with "
+                "--audio-device <index|name>, or run with --no-audio."
+            ) from error
+
+        print(
+            f"Selected output device {index} "
+            f"({devices[index]['name']}): {reason}"
+        )
+
+        if is_bluetooth_name(devices[index]["name"]):
+            print(
+                "WARNING: Bluetooth audio adds about 100-250 ms of "
+                "latency. Use wired earphones for the demo."
+            )
+
+        return index
 
     # ======================================================
     # COORDINATE CONVERSION

@@ -21,10 +21,31 @@ class NavigationPipeline:
         self,
         perception,
         severity: HazardSeverityClassifier,
+        audio_enabled: bool = True,
+        audio_device=None,
+        sofa_path: str = "hrtf/mit_kemar_normal_pinna.sofa",
+        hrtf_renderer=None,
     ) -> None:
+        """audio_enabled=False (the --no-audio path) skips HRTF entirely:
+        warnings are still computed and returned, nothing is played.
+
+        audio_device is an index, a numeric string or a name fragment
+        (None = automatic, wired headphones preferred). hrtf_renderer
+        injects a ready renderer (e.g. in tests) and wins over the rest.
+        """
+
         self.perception = perception
         self.severity = severity
-        self.hrtf_renderer = HRTFRenderer()
+
+        if hrtf_renderer is not None:
+            self.hrtf_renderer = hrtf_renderer
+        elif audio_enabled:
+            self.hrtf_renderer = HRTFRenderer(
+                sofa_path=sofa_path,
+                output_device=audio_device,
+            )
+        else:
+            self.hrtf_renderer = None
 
     def process_cycle(
         self,
@@ -51,9 +72,10 @@ class NavigationPipeline:
 
                 # Play spatial warning based on
                 # the detected obstacle's azimuth.
-                self.hrtf_renderer.play_warning(
-                    warning.azimuth_deg
-                )
+                if self.hrtf_renderer is not None:
+                    self.hrtf_renderer.play_warning(
+                        warning.azimuth_deg
+                    )
 
         return CycleResult(
             frame.frame_id,
@@ -61,3 +83,9 @@ class NavigationPipeline:
             warnings,
             detections,
         )
+
+    def close(self) -> None:
+        """Stop audio and its worker thread (no-op without audio)."""
+
+        if self.hrtf_renderer is not None:
+            self.hrtf_renderer.close()
