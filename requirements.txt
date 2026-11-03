@@ -1,1 +1,2 @@
-# The review prototype uses only Python's standard library.
+# Core dependencies for the deterministic review prototype and its tests.
+numpy

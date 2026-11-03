@@ -21,15 +21,19 @@ def distance_band_for(distance_m: float) -> str:
     return "far"
 
 
-def make_warning(detection: Detection, score: float, reason: str) -> WarningEvent:
+def make_warning(
+    detection: Detection,
+    score: float,
+    reason: str,
+) -> WarningEvent:
     return WarningEvent(
         object_id=detection.object_id,
         label=detection.label,
         direction=direction_for(detection.azimuth_deg),
+        azimuth_deg=detection.azimuth_deg,
         distance_band=distance_band_for(detection.distance),
         distance_m=detection.distance,
         score=score,
         motion=detection.motion.value,
         reason=reason,
     )
-
