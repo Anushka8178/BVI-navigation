@@ -1,4 +1,5 @@
 import os
+import sqlite3
 import tempfile
 import unittest
 
@@ -92,6 +93,46 @@ class TestRouteMemoryDecay(unittest.TestCase):
 
         self.assertEqual(removed, 1)
         self.assertEqual(memory.get_hazards(), [])
+
+    def test_velocity_is_persisted_alongside_decay(self) -> None:
+        memory = RouteMemory(self.db_path, decay_half_life_s=10.0, min_decay_weight=0.0)
+
+        entry = memory.remember(
+            "person-1", "person", 1.0, 2.0, 0.8, timestamp=0.0,
+            velocity_x=0.3, velocity_y=-1.2,
+        )
+        memory.remember("pole-1", "pole", 0.0, 3.0, 0.9, timestamp=10.0)
+
+        self.assertAlmostEqual(entry.velocity_x, 0.3)
+        hazards = {hazard.object_id: hazard for hazard in memory.get_hazards()}
+        self.assertAlmostEqual(hazards["person-1"].velocity_x, 0.3)
+        self.assertAlmostEqual(hazards["person-1"].velocity_y, -1.2)
+        self.assertAlmostEqual(hazards["person-1"].decay_weight, 0.5)
+        self.assertAlmostEqual(hazards["pole-1"].velocity_x, 0.0)
+
+    def test_legacy_database_without_velocity_columns_is_migrated(self) -> None:
+        connection = sqlite3.connect(self.db_path)
+        connection.execute(
+            """
+            CREATE TABLE hazards (
+                object_id TEXT PRIMARY KEY, label TEXT NOT NULL,
+                world_x REAL NOT NULL, world_y REAL NOT NULL,
+                confidence REAL NOT NULL, timestamp REAL NOT NULL,
+                decay_weight REAL NOT NULL DEFAULT 1.0
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO hazards VALUES ('pole-1', 'pole', 1.0, 0.0, 0.9, 0.0, 1.0)"
+        )
+        connection.commit()
+        connection.close()
+
+        hazards = RouteMemory(self.db_path).get_hazards()
+
+        self.assertEqual(len(hazards), 1)
+        self.assertAlmostEqual(hazards[0].velocity_x, 0.0)
+        self.assertAlmostEqual(hazards[0].velocity_y, 0.0)
 
 
 if __name__ == "__main__":
