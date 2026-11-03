@@ -1,11 +1,54 @@
 from __future__ import annotations
 
+import threading
 import time
+from collections import deque
+from dataclasses import dataclass
 
 import numpy as np
-import sounddevice as sd
 import sofar
 from scipy import signal
+
+URGENT = "urgent"
+SOFT = "soft"
+
+
+class SoundDeviceBackend:
+    """Default output backend: plays through sounddevice.
+
+    play() blocks until the sound ends (or stop() is called), but it is
+    only ever called from the renderer's worker thread.
+    """
+
+    def __init__(self):
+        try:
+            import sounddevice
+        except Exception as error:  # PortAudio missing, no audio stack, ...
+            raise RuntimeError(
+                "sounddevice is not available "
+                f"({error}). Run with --no-audio."
+            ) from error
+
+        self.sd = sounddevice
+
+    def play(self, audio, samplerate, device):
+        self.sd.play(
+            audio,
+            samplerate=samplerate,
+            device=device,
+            blocking=False,
+        )
+        self.sd.wait()
+
+    def stop(self):
+        self.sd.stop()
+
+
+@dataclass
+class _Cue:
+    kind: str
+    azimuth_deg: float
+    cancelled: bool = False
 
 
 class HRTFRenderer:
@@ -30,6 +73,11 @@ class HRTFRenderer:
         physical azimuth -> SOFA azimuth
 
     exactly once, immediately before HRTF lookup.
+
+    Playback is asynchronous: play_warning() and play_path_guidance()
+    only put a cue on a small queue (max_queue items) and return at once.
+    A background worker renders and plays the cues. Urgent cues drop any
+    queued soft cues and interrupt a soft cue that is already playing.
     """
 
     def __init__(
@@ -37,6 +85,8 @@ class HRTFRenderer:
         sofa_path="hrtf/mit_kemar_normal_pinna.sofa",
         output_device=None,
         warning_cooldown=0.8,
+        backend=None,
+        max_queue=2,
     ):
         print("Loading HRTF file...")
 
@@ -70,8 +120,24 @@ class HRTFRenderer:
         self.last_path_guidance_time = 0.0
 
         # --------------------------------------------------
+        # Output backend
+        # --------------------------------------------------
+
+        use_sounddevice = backend is None
+
+        self.backend = (
+            SoundDeviceBackend()
+            if use_sounddevice
+            else backend
+        )
+
+        # --------------------------------------------------
         # Output device
         # --------------------------------------------------
+
+        if not use_sounddevice and output_device is None:
+            # Custom backends choose their own output.
+            output_device = "default"
 
         self.device = (
             output_device
@@ -87,9 +153,9 @@ class HRTFRenderer:
             f"Audio output device: {self.device}"
         )
 
-        if self.device is not None:
+        if use_sounddevice and self.device is not None:
             try:
-                device_info = sd.query_devices(
+                device_info = self.backend.sd.query_devices(
                     self.device
                 )
 
@@ -104,12 +170,31 @@ class HRTFRenderer:
                     f"{error}"
                 )
 
+        # --------------------------------------------------
+        # Playback worker
+        # --------------------------------------------------
+
+        self.max_queue = max(1, int(max_queue))
+        self._queue: deque[_Cue] = deque()
+        self._playing: _Cue | None = None
+        self._closed = False
+        self._lock = threading.Condition()
+
+        self._worker = threading.Thread(
+            target=self._worker_loop,
+            name="hrtf-audio",
+            daemon=True,
+        )
+        self._worker.start()
+
     # ======================================================
     # OUTPUT DEVICE
     # ======================================================
 
     def find_output_device(self):
         """Find a suitable headphone/output device."""
+
+        sd = self.backend.sd
 
         try:
             devices = sd.query_devices()
@@ -661,9 +746,12 @@ class HRTFRenderer:
         azimuth_deg=0.0,
         force=False,
     ):
-        """Play an urgent warning from the obstacle's direction.
+        """Queue an urgent warning from the obstacle's direction.
 
         azimuth_deg uses the PROJECT physical convention.
+
+        Never blocks: returns True if the cue was queued, False if it
+        was skipped (cooldown) or dropped.
         """
 
         now = time.monotonic()
@@ -678,41 +766,12 @@ class HRTFRenderer:
         ):
             return False
 
-        try:
-            audio = (
-                self.create_warning_sound(
-                    azimuth_deg,
-                    0.5,
-                )
-            )
-
-            print(
-                "Playing URGENT HRTF warning "
-                f"at physical "
-                f"{azimuth_deg:+.1f}°"
-            )
-
-            sd.play(
-                audio,
-                samplerate=self.sample_rate,
-                device=self.device,
-                blocking=True,
-            )
-
-            self.last_warning_time = (
-                time.monotonic()
-            )
-
-            return True
-
-        except Exception as error:
-
-            print(
-                f"Could not play warning "
-                f"sound: {error}"
-            )
-
+        if not self._enqueue(_Cue(URGENT, float(azimuth_deg))):
             return False
+
+        self.last_warning_time = now
+
+        return True
 
     # ======================================================
     # PLAY PATH GUIDANCE
@@ -723,9 +782,12 @@ class HRTFRenderer:
         azimuth_deg=0.0,
         force=False,
     ):
-        """Play a soft cue toward the recommended walking direction.
+        """Queue a soft cue toward the recommended walking direction.
 
         azimuth_deg uses the PROJECT physical convention.
+
+        Never blocks: returns True if the cue was queued, False if it
+        was skipped (cooldown) or dropped.
         """
 
         now = time.monotonic()
@@ -740,51 +802,148 @@ class HRTFRenderer:
         ):
             return False
 
-        try:
-            audio = (
-                self.create_path_guidance_sound(
-                    azimuth_deg,
-                    0.45,
+        if not self._enqueue(_Cue(SOFT, float(azimuth_deg))):
+            return False
+
+        self.last_path_guidance_time = now
+
+        return True
+
+    # ======================================================
+    # QUEUE + WORKER
+    # ======================================================
+
+    def _enqueue(self, cue: _Cue) -> bool:
+        """Add a cue to the bounded queue. Returns False if dropped."""
+
+        interrupt = False
+
+        with self._lock:
+            if self._closed:
+                return False
+
+            if cue.kind == URGENT:
+                # Urgent pre-empts: drop queued soft cues ...
+                self._queue = deque(
+                    queued
+                    for queued in self._queue
+                    if queued.kind == URGENT
                 )
+
+                # ... and cut off a soft cue that is playing now.
+                if (
+                    self._playing is not None
+                    and self._playing.kind == SOFT
+                ):
+                    self._playing.cancelled = True
+                    interrupt = True
+
+                # Full of urgent cues: the newest direction wins.
+                while len(self._queue) >= self.max_queue:
+                    self._queue.popleft()
+
+            else:
+                if len(self._queue) >= self.max_queue:
+                    oldest_soft = next(
+                        (
+                            queued
+                            for queued in self._queue
+                            if queued.kind == SOFT
+                        ),
+                        None,
+                    )
+
+                    if oldest_soft is None:
+                        # Queue holds only urgent cues.
+                        return False
+
+                    self._queue.remove(oldest_soft)
+
+            self._queue.append(cue)
+            self._lock.notify()
+
+        if interrupt:
+            self._stop_backend()
+
+        return True
+
+    def _worker_loop(self):
+        while True:
+            with self._lock:
+                while not self._queue and not self._closed:
+                    self._lock.wait()
+
+                if self._closed:
+                    return
+
+                cue = self._queue.popleft()
+                self._playing = cue
+
+            try:
+                self._play_cue(cue)
+
+            except Exception as error:
+                print(
+                    f"Could not play {cue.kind} "
+                    f"sound: {error}"
+                )
+
+            finally:
+                finished = time.monotonic()
+
+                with self._lock:
+                    self._playing = None
+
+                    # Cooldown runs from the end of playback, as it
+                    # did when playback was blocking.
+                    if cue.kind == URGENT:
+                        self.last_warning_time = finished
+                    else:
+                        self.last_path_guidance_time = finished
+
+    def _play_cue(self, cue: _Cue):
+        if cue.kind == URGENT:
+            audio = self.create_warning_sound(
+                cue.azimuth_deg,
+                0.5,
             )
 
-            print(
+            label = (
+                "Playing URGENT HRTF warning "
+                f"at physical "
+                f"{cue.azimuth_deg:+.1f}°"
+            )
+
+        else:
+            audio = self.create_path_guidance_sound(
+                cue.azimuth_deg,
+                0.45,
+            )
+
+            label = (
                 "Playing SOFT path-guidance "
                 "cue toward physical "
-                f"{azimuth_deg:+.1f}°"
+                f"{cue.azimuth_deg:+.1f}°"
             )
 
-            sd.play(
-                audio,
-                samplerate=self.sample_rate,
-                device=self.device,
-                blocking=True,
-            )
+        if cue.cancelled:
+            return
 
-            self.last_path_guidance_time = (
-                time.monotonic()
-            )
+        print(label)
 
-            return True
-
-        except Exception as error:
-
-            print(
-                f"Could not play path "
-                f"guidance sound: {error}"
-            )
-
-            return False
+        self.backend.play(
+            audio,
+            self.sample_rate,
+            self.device,
+        )
 
     # ======================================================
     # STOP / CLOSE
     # ======================================================
 
-    def stop(self):
-        """Stop currently playing audio."""
-
+    def _stop_backend(self):
         try:
-            sd.stop()
+            self.backend.stop()
 
         except Exception as error:
 
@@ -793,7 +952,23 @@ class HRTFRenderer:
                 f"{error}"
             )
 
-    def close(self):
-        """Stop and close the renderer."""
+    def stop(self):
+        """Drop queued cues and stop currently playing audio."""
+
+        with self._lock:
+            self._queue.clear()
+
+            if self._playing is not None:
+                self._playing.cancelled = True
+
+        self._stop_backend()
+
+    def close(self, timeout=1.0):
+        """Stop audio and shut down the worker thread."""
+
+        with self._lock:
+            self._closed = True
+            self._lock.notify_all()
 
         self.stop()
+        self._worker.join(timeout)
