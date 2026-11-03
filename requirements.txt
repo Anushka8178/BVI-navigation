@@ -1,2 +1,14 @@
-# Core dependencies for the deterministic review prototype and its tests.
-numpy
+# Core numerical/scientific dependencies
+numpy>=1.26,<3
+scipy>=1.11,<2
+
+# Audio / HRTF
+sounddevice>=0.5,<1
+sofar>=1.2,<2
+
+# Computer vision / YOLO
+opencv-python>=4.10,<5
+ultralytics>=8.3,<9
+
+# Testing
+pytest>=8,<9

@@ -8,6 +8,7 @@ venv/
 # Dataset: never upload
 datasets/
 Obstacle Dataset/
+dataset/obstacle_yolo/
 
 # Training outputs
 runs/
@@ -37,3 +38,11 @@ Thumbs.db
 # Local configuration
 .env
 outputs/
+
+# Generated test reports
+output_memory*.json
+
+videos/*_navigation.json
+videos/results.csv
+videos/labels.jpg.jpeg
+videos/*_navigation*.json

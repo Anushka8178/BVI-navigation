@@ -23,6 +23,8 @@ class HazardEntry:
     timestamp: float
     decay_weight: float = 1.0
     priority: float = 0.0
+    velocity_x: float = 0.0
+    velocity_y: float = 0.0
 
 
 class RouteMemory:
@@ -80,10 +82,27 @@ class RouteMemory:
                     world_y REAL NOT NULL,
                     confidence REAL NOT NULL,
                     timestamp REAL NOT NULL,
-                    decay_weight REAL NOT NULL DEFAULT 1.0
+                    decay_weight REAL NOT NULL DEFAULT 1.0,
+                    velocity_x REAL NOT NULL DEFAULT 0.0,
+                    velocity_y REAL NOT NULL DEFAULT 0.0
                 )
                 """
             )
+
+            # Migrate databases created by the previous version.
+            columns = {
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA table_info(hazards)"
+                ).fetchall()
+            }
+
+            for column in ("velocity_x", "velocity_y"):
+                if column not in columns:
+                    connection.execute(
+                        f"ALTER TABLE hazards ADD COLUMN {column} "
+                        "REAL NOT NULL DEFAULT 0.0"
+                    )
 
     def remember(
         self,
@@ -93,6 +112,8 @@ class RouteMemory:
         world_y: float,
         confidence: float,
         timestamp: float | None = None,
+        velocity_x: float = 0.0,
+        velocity_y: float = 0.0,
     ) -> HazardEntry:
         """Save a hazard in persistent world coordinates.
 
@@ -117,16 +138,20 @@ class RouteMemory:
                     world_y,
                     confidence,
                     timestamp,
-                    decay_weight
+                    decay_weight,
+                    velocity_x,
+                    velocity_y
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(object_id) DO UPDATE SET
                     label = excluded.label,
                     world_x = excluded.world_x,
                     world_y = excluded.world_y,
                     confidence = excluded.confidence,
                     timestamp = excluded.timestamp,
-                    decay_weight = excluded.decay_weight
+                    decay_weight = excluded.decay_weight,
+                    velocity_x = excluded.velocity_x,
+                    velocity_y = excluded.velocity_y
                 """,
                 (
                     object_id,
@@ -136,6 +161,8 @@ class RouteMemory:
                     confidence,
                     timestamp,
                     decay_weight,
+                    velocity_x,
+                    velocity_y,
                 ),
             )
 
@@ -149,6 +176,8 @@ class RouteMemory:
             confidence=confidence,
             timestamp=timestamp,
             decay_weight=decay_weight,
+            velocity_x=velocity_x,
+            velocity_y=velocity_y,
         )
 
     def decay_and_prune(self, now: float | None = None) -> int:
@@ -222,7 +251,9 @@ class RouteMemory:
                     world_y,
                     confidence,
                     timestamp,
-                    decay_weight
+                    decay_weight,
+                    velocity_x,
+                    velocity_y
                 FROM hazards
                 ORDER BY timestamp DESC
                 """
@@ -237,6 +268,8 @@ class RouteMemory:
                 confidence=row[4],
                 timestamp=row[5],
                 decay_weight=row[6],
+                velocity_x=row[7],
+                velocity_y=row[8],
             )
             for row in rows
         ]
