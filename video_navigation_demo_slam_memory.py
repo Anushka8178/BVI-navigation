@@ -672,6 +672,7 @@ def main() -> None:
         "warning_events": warning_events,
         "persistent_memory": [
             {
+                "hazard_id": hazard.hazard_id,
                 "object_id": hazard.object_id,
                 "label": hazard.label,
                 "world_x": round(hazard.world_x, 3),

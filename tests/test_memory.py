@@ -133,6 +133,138 @@ class TestRouteMemoryDecay(unittest.TestCase):
         self.assertEqual(len(hazards), 1)
         self.assertAlmostEqual(hazards[0].velocity_x, 0.0)
         self.assertAlmostEqual(hazards[0].velocity_y, 0.0)
+        self.assertEqual(hazards[0].object_id, "pole-1")
+        self.assertEqual(len(hazards[0].hazard_id), 36)  # uuid4 string
+
+    def test_legacy_object_id_keyed_database_is_migrated(self) -> None:
+        connection = sqlite3.connect(self.db_path)
+        connection.execute(
+            """
+            CREATE TABLE hazards (
+                object_id TEXT PRIMARY KEY, label TEXT NOT NULL,
+                world_x REAL NOT NULL, world_y REAL NOT NULL,
+                confidence REAL NOT NULL, timestamp REAL NOT NULL,
+                decay_weight REAL NOT NULL DEFAULT 1.0,
+                velocity_x REAL NOT NULL DEFAULT 0.0,
+                velocity_y REAL NOT NULL DEFAULT 0.0
+            )
+            """
+        )
+        connection.executemany(
+            "INSERT INTO hazards VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                ("pole-1", "pole", 1.0, 0.0, 0.9, 0.0, 1.0, 0.0, 0.0),
+                ("person-2", "person", 4.0, 4.0, 0.7, 0.0, 1.0, 0.2, 0.3),
+            ],
+        )
+        connection.commit()
+        connection.close()
+
+        memory = RouteMemory(self.db_path, min_decay_weight=0.0)
+        hazards = {h.object_id: h for h in memory.get_hazards()}
+
+        self.assertEqual(set(hazards), {"pole-1", "person-2"})
+        self.assertAlmostEqual(hazards["person-2"].velocity_y, 0.3)
+        self.assertNotEqual(hazards["pole-1"].hazard_id, hazards["person-2"].hazard_id)
+
+        # Reopening an already-migrated DB keeps the same ids.
+        reopened = {h.object_id: h.hazard_id for h in RouteMemory(self.db_path).get_hazards()}
+        self.assertEqual(reopened["pole-1"], hazards["pole-1"].hazard_id)
+
+
+class TestRouteMemoryMatching(unittest.TestCase):
+    def setUp(self) -> None:
+        handle, self.db_path = tempfile.mkstemp(suffix=".db")
+        os.close(handle)
+        os.remove(self.db_path)
+
+    def tearDown(self) -> None:
+        if os.path.exists(self.db_path):
+            os.remove(self.db_path)
+
+    def _memory(self) -> RouteMemory:
+        return RouteMemory(
+            self.db_path, decay_half_life_s=1_000.0, min_decay_weight=0.0,
+            match_radius_m=1.0,
+        )
+
+    def test_same_object_across_two_runs_is_matched_not_duplicated(self) -> None:
+        run1 = self._memory()
+        first = run1.remember("pole-1", "pole", 2.0, 5.0, 0.9, timestamp=0.0)
+
+        # New run: YOLO track ids restart, so the same pole gets another id
+        # and a slightly different position estimate.
+        run2 = self._memory()
+        second = run2.remember("pole-4", "pole", 2.3, 5.2, 0.8, timestamp=5.0)
+
+        hazards = run2.get_hazards()
+        self.assertEqual(len(hazards), 1)
+        self.assertEqual(second.hazard_id, first.hazard_id)
+        self.assertEqual(hazards[0].object_id, "pole-4")  # latest track hint
+        self.assertAlmostEqual(hazards[0].world_x, 2.3)
+
+    def test_reused_track_id_in_new_run_does_not_merge_distant_objects(self) -> None:
+        run1 = self._memory()
+        first = run1.remember("person-1", "person", 0.0, 2.0, 0.9, timestamp=0.0)
+
+        run2 = self._memory()
+        second = run2.remember("person-1", "person", 5.0, 8.0, 0.9, timestamp=5.0)
+
+        self.assertNotEqual(second.hazard_id, first.hazard_id)
+        self.assertEqual(len(run2.get_hazards()), 2)
+
+    def test_two_people_three_metres_apart_stay_separate(self) -> None:
+        memory = self._memory()
+
+        a0 = memory.remember("person-1", "person", 0.0, 4.0, 0.9, timestamp=0.0)
+        b0 = memory.remember("person-2", "person", 3.0, 4.0, 0.9, timestamp=0.0)
+        a1 = memory.remember("person-1", "person", 0.1, 4.0, 0.9, timestamp=0.1)
+        b1 = memory.remember("person-2", "person", 2.9, 4.0, 0.9, timestamp=0.1)
+
+        self.assertNotEqual(a0.hazard_id, b0.hazard_id)
+        self.assertEqual(a1.hazard_id, a0.hazard_id)
+        self.assertEqual(b1.hazard_id, b0.hazard_id)
+        self.assertEqual(len(memory.get_hazards()), 2)
+
+    def test_same_track_keeps_hazard_even_beyond_radius(self) -> None:
+        memory = self._memory()
+
+        first = memory.remember("car-3", "car", 0.0, 10.0, 0.9, timestamp=0.0)
+        second = memory.remember("car-3", "car", 0.0, 13.0, 0.9, timestamp=0.5)
+
+        self.assertEqual(second.hazard_id, first.hazard_id)
+        self.assertEqual(len(memory.get_hazards()), 1)
+
+    def test_dynamic_label_matches_predicted_position(self) -> None:
+        memory = self._memory()
+        first = memory.remember(
+            "person-1", "person", 0.0, 0.0, 0.9, timestamp=0.0,
+            velocity_x=0.0, velocity_y=1.0,
+        )
+
+        # Track lost; new id 1.5 m further along the walking direction.
+        # Raw distance 1.5 m > radius, predicted distance 0 m.
+        matched = self._memory().remember(
+            "person-9", "person", 0.0, 1.5, 0.9, timestamp=1.5,
+        )
+        self.assertEqual(matched.hazard_id, first.hazard_id)
+
+    def test_static_label_does_not_use_velocity_prediction(self) -> None:
+        memory = self._memory()
+        first = memory.remember(
+            "pole-1", "pole", 0.0, 0.0, 0.9, timestamp=0.0,
+            velocity_x=0.0, velocity_y=1.0,  # e.g. tracker jitter
+        )
+        other = memory.remember("pole-2", "pole", 0.0, 1.5, 0.9, timestamp=1.5)
+
+        self.assertNotEqual(other.hazard_id, first.hazard_id)
+
+    def test_different_labels_never_match(self) -> None:
+        memory = self._memory()
+        pole = memory.remember("pole-1", "pole", 0.0, 2.0, 0.9, timestamp=0.0)
+        cone = memory.remember("reflective_cone-1", "reflective_cone", 0.1, 2.0, 0.9, timestamp=1.0)
+
+        self.assertNotEqual(pole.hazard_id, cone.hazard_id)
 
 
 if __name__ == "__main__":
