@@ -20,6 +20,11 @@ def test_repo_config_loads_with_planner_branch_safety_margin():
     assert config["network"]["esp32_distance_port"] == 5005
     assert config["network"]["esp32_vibration_port"] == 5006
     assert config["memory"]["match_radius_m"] == 1.0
+    assert config["network"]["phone_ip"] == "10.47.242.217"
+    assert config["network"]["sensor_port"] == 8081
+    assert config["pose"]["stride_m"] == 0.7
+    assert config["pose"]["stale_after_s"] == 2.0
+    assert config["perception"]["weights"] == "best.pt"
 
 
 @pytest.mark.parametrize(

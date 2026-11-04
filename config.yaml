@@ -30,9 +30,20 @@ network:
   esp32_vibration_port: 5006 # laptop -> ESP32: "V,<ms>"
 
 # ------------------------------------------------------------------
+# Pose (navigation/sensing.py PhonePose; SensorServer app on the phone,
+# ws://<network.phone_ip>:<network.sensor_port>)
+# ------------------------------------------------------------------
+pose:
+  stride_m: 0.7              # distance moved per detected step
+  stale_after_s: 2.0         # no rotation data this long -> pose invalid
+  reconnect_delay_s: 1.0     # wait between WebSocket reconnect attempts
+  startup_wait_s: 3.0        # wait this long for the first heading
+
+# ------------------------------------------------------------------
 # Perception
 # ------------------------------------------------------------------
 perception:
+  weights: best.pt          # YOLO weights (--weights overrides)
   confidence: 0.35
   device: cpu                # "cpu" or a CUDA index such as "0"
 

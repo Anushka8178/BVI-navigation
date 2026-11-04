@@ -11,19 +11,23 @@ Pipeline:
       -> urgent HRTF or soft path-guidance HRTF
       -> annotated video + JSON report
 
-Important:
-    Pose/localization is simulated in this prototype. It is not real SLAM.
+Pose (--pose): "phone" reads heading + steps from the SensorServer app on
+the chest-mounted phone (default for stream URLs); "sim" uses a simulated
+walk (default for video files). While the phone pose is invalid (no sensor
+data for pose.stale_after_s), nothing is written to persistent memory.
 
 All tunables come from config.yaml (see --config). Dedicated flags such as
 --confidence, and any number of --set section.key=value, override it.
 
 Examples (PowerShell):
     # Recorded video
-    python video_navigation_demo_slam_memory.py --weights best.pt `
+    python video_navigation_demo_slam_memory.py `
         --source videos\\street6.mp4 --output videos\\street6_navigation.mp4 --reset
 
     # Live phone camera (IP Webcam app); default source is camera.source
-    python video_navigation_demo_slam_memory.py --weights best.pt --no-display
+    python video_navigation_demo_slam_memory.py --no-display
+
+Weights default to perception.weights in config.yaml (best.pt).
 """
 
 from __future__ import annotations
@@ -52,7 +56,7 @@ from navigation.memory import RouteMemory
 from navigation.models import FramePacket, Pose
 from navigation.planner import LocalPathPlanner
 from navigation.reasoning import AcousticAttention
-from navigation.sensing import localize_detection, simulated_pose
+from navigation.sensing import PhonePose, localize_detection, simulated_pose
 from navigation.trajectory import HazardTrajectoryTracker
 from navigation.yolo_perception import YOLOPerception
 
@@ -90,6 +94,7 @@ def draw_status(
     top_hazards: list,
     path_decision,
     audio_enabled: bool,
+    pose_mode: str = "sim",
 ) -> None:
     """Draw a compact navigation status panel on the frame."""
     image_height, image_width = image.shape[:2]
@@ -114,8 +119,8 @@ def draw_status(
 
     lines = [
         (
-            f"Pose(sim): x={pose.x:.2f} y={pose.y:.2f} "
-            f"heading={pose.heading_deg:.1f}°"
+            f"Pose({pose_mode}{'' if pose.valid else ', INVALID'}): "
+            f"x={pose.x:.2f} y={pose.y:.2f} heading={pose.heading_deg:.1f}°"
         ),
         f"Detections: {detection_count} | Urgent warnings: {len(warnings)}",
         f"Spatial audio: {'ON' if audio_enabled else 'OFF'}",
@@ -193,8 +198,15 @@ def main() -> None:
     parser.add_argument(
         "--weights",
         type=Path,
-        required=True,
-        help="YOLO weights, e.g. best.pt",
+        default=None,
+        help="YOLO weights (config: perception.weights, default best.pt)",
+    )
+    parser.add_argument(
+        "--pose",
+        choices=("sim", "phone"),
+        default=None,
+        help="Pose source: phone = SensorServer app (heading + steps), "
+        "sim = simulated walk (default: phone for stream URLs, sim for files)",
     )
     parser.add_argument(
         "--config",
@@ -288,6 +300,9 @@ def main() -> None:
             config,
             {
                 "camera.source": args.source,
+                "perception.weights": (
+                    None if args.weights is None else str(args.weights)
+                ),
                 "perception.confidence": args.confidence,
                 "perception.device": args.device,
                 "memory.db_path": None if args.db is None else str(args.db),
@@ -303,9 +318,13 @@ def main() -> None:
     memory_cfg = config["memory"]
     attention_cfg = config["attention"]
     audio_cfg = config["audio"]
+    pose_cfg = config["pose"]
+    network_cfg = config["network"]
 
     source = str(camera_cfg["source"])
     live = is_url(source)
+    weights_path = Path(perception_cfg["weights"])
+    pose_mode = args.pose or ("phone" if live else "sim")
     db_path = Path(memory_cfg["db_path"])
     hrtf_path = Path(audio_cfg["hrtf_path"])
 
@@ -321,9 +340,9 @@ def main() -> None:
             f"{source_path.stem}_navigation.mp4"
         )
 
-    if not args.weights.exists():
+    if not weights_path.exists():
         raise SystemExit(
-            f"Trained model does not exist: {args.weights.resolve()}"
+            f"Trained model does not exist: {weights_path.resolve()}"
         )
 
     if not args.no_audio and not hrtf_path.exists():
@@ -353,7 +372,7 @@ def main() -> None:
     print("\nInitializing navigation pipeline...\n")
 
     perception = YOLOPerception(
-        weights=args.weights,
+        weights=weights_path,
         confidence=float(perception_cfg["confidence"]),
         device=str(perception_cfg["device"]),
     )
@@ -401,6 +420,41 @@ def main() -> None:
     else:
         print("HRTF spatial audio disabled.\n")
 
+    phone_pose: PhonePose | None = None
+
+    if pose_mode == "phone":
+        phone_pose = PhonePose(
+            phone_ip=str(network_cfg["phone_ip"]),
+            sensor_port=int(network_cfg["sensor_port"]),
+            stride_m=float(pose_cfg["stride_m"]),
+            stale_after_s=float(pose_cfg["stale_after_s"]),
+            reconnect_delay_s=float(pose_cfg["reconnect_delay_s"]),
+        )
+        print(
+            "Connecting to phone sensors at "
+            f"ws://{phone_pose.phone_ip}:{phone_pose.sensor_port} ..."
+        )
+        try:
+            phone_pose.start()
+        except RuntimeError as error:
+            frame_source.close()
+            if hrtf_renderer is not None:
+                hrtf_renderer.close()
+            raise SystemExit(f"Phone pose setup failed: {error}") from error
+
+        if phone_pose.wait_for_heading(float(pose_cfg["startup_wait_s"])):
+            phone_pose.calibrate()
+            print("Phone pose ready; current heading set as 0.\n")
+        else:
+            print(
+                "WARNING: no rotation data from the phone yet. Check the "
+                "SensorServer app and network.phone_ip/sensor_port, or use "
+                "--pose sim. Continuing; memory is paused until the pose is "
+                "valid, and the first heading becomes 0.\n"
+            )
+    else:
+        print("Pose: simulated walk (--pose sim).\n")
+
     if args.reset:
         memory.clear()
         print(
@@ -422,6 +476,8 @@ def main() -> None:
     last_received = 0
     last_dropped = 0
     first_timestamp: float | None = None
+    pose_was_valid: bool | None = None
+    invalid_pose_frames = 0
 
     try:
         while True:
@@ -473,7 +529,22 @@ def main() -> None:
                 image=image,
             )
 
-            pose = simulated_pose(elapsed_s)
+            if phone_pose is not None:
+                pose = phone_pose.get_pose(timestamp)
+            else:
+                pose = simulated_pose(elapsed_s)
+
+            if not pose.valid:
+                invalid_pose_frames += 1
+            if pose.valid != pose_was_valid:
+                if pose_was_valid is not None or not pose.valid:
+                    print(
+                        "POSE | valid, memory writing resumed"
+                        if pose.valid
+                        else "POSE | INVALID (no phone sensor data), "
+                        "memory writing paused"
+                    )
+                pose_was_valid = pose.valid
             detections = perception.process(frame_packet)
 
             # -------------------------------------------------
@@ -506,6 +577,8 @@ def main() -> None:
                     timestamp=localized.timestamp,
                     velocity_x=track.velocity_x,
                     velocity_y=track.velocity_y,
+                    # Invalid pose: world position unknown, don't store it.
+                    persist=pose.valid,
                 )
 
                 current_frame_hazards.append(entry)
@@ -652,6 +725,7 @@ def main() -> None:
                 top_hazards,
                 path_decision,
                 audio_enabled=hrtf_renderer is not None,
+                pose_mode=pose_mode,
             )
 
             writer.write(display)
@@ -716,8 +790,7 @@ def main() -> None:
                         f"{warning.distance_m:.1f}m | "
                         f"{warning.category} | TTC={ttc_text} | "
                         f"score={warning.score:.2f} | "
-                        f"physical_azimuth={warning.azimuth_deg:+.1f}° | "
-                        f"audio_azimuth={warning.azimuth_deg * -2.5:+.1f}°"
+                        f"physical_azimuth={warning.azimuth_deg:+.1f}°"
                     )
                     
 
@@ -757,13 +830,17 @@ def main() -> None:
         if hrtf_renderer is not None:
             hrtf_renderer.close()
 
+        if phone_pose is not None:
+            phone_pose.close()
+
     processing_seconds = time.perf_counter() - processing_started
     persisted_hazards = memory.get_hazards()
 
     report = {
         "source_video": source if live else str(Path(source).resolve()),
         "live_source": live,
-        "model_weights": str(args.weights.resolve()),
+        "model_weights": str(weights_path.resolve()),
+        "pose_source": pose_mode,
         "annotated_video": str(output_path.resolve()),
         "memory_db": str(db_path.resolve()),
         "config": config,
@@ -776,6 +853,7 @@ def main() -> None:
         "audio_warnings_played": audio_warning_count,
         "path_warning_audio_played": path_warning_audio_count,
         "frames_processed": frame_id,
+        "invalid_pose_frames": invalid_pose_frames,
         "video_fps": fps,
         "warning_frames": warning_frames,
         "unique_warning_objects": len(unique_warning_ids),
@@ -817,7 +895,13 @@ def main() -> None:
         },
         "limitations": [
             "Distance is estimated from object height and bounding-box size, not measured depth.",
-            "Pose comes from a deterministic simulated trajectory, not real SLAM/localization.",
+            (
+                "Pose is phone heading + step counting (stride from config); "
+                "position drifts over long walks."
+                if pose_mode == "phone"
+                else "Pose comes from a deterministic simulated trajectory, "
+                "not real localization."
+            ),
             "Trajectory velocity is estimated from localized detections and can be noisy.",
             "TTC is a prototype prediction based on estimated relative motion and safety radii.",
             "HRTF uses the nearest horizontal-plane measurement available in the SOFA file.",

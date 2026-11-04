@@ -227,8 +227,13 @@ class RouteMemory:
         timestamp: float | None = None,
         velocity_x: float = 0.0,
         velocity_y: float = 0.0,
+        persist: bool = True,
     ) -> HazardEntry:
         """Save a detection, merging it into an existing hazard if it matches.
+
+        With persist=False (localization invalid: the world position can't
+        be trusted) nothing is written or decayed; the entry is returned
+        only so the planner can still use this frame's hazard.
 
         `object_id` is the YOLO track id ("label-N"). It is used as a hint
         so the same track keeps the same hazard, but never as the key. The
@@ -245,6 +250,20 @@ class RouteMemory:
             timestamp = time.time()
 
         decay_weight = 1.0
+
+        if not persist:
+            return HazardEntry(
+                object_id=object_id,
+                label=label,
+                world_x=world_x,
+                world_y=world_y,
+                confidence=confidence,
+                timestamp=timestamp,
+                decay_weight=decay_weight,
+                velocity_x=velocity_x,
+                velocity_y=velocity_y,
+                hazard_id=self._track_to_hazard.get(object_id, ""),
+            )
 
         with contextlib.closing(self._connect()) as connection, connection:
             hazard_id = self._match_hazard(

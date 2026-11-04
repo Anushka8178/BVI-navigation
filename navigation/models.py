@@ -93,6 +93,9 @@ class Pose:
     y: float
     heading_deg: float
     timestamp: float
+    # False when localization is lost (e.g. phone sensors silent). The
+    # pipeline then stops writing world positions into persistent memory.
+    valid: bool = True
 
 
 @dataclass(frozen=True)

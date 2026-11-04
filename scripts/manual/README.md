@@ -11,6 +11,7 @@ python -m scripts.manual.test_hrtf
 
 | Script | Needs | What it checks |
 |---|---|---|
+| `check_phone_pose.py` | phone running SensorServer | Prints live heading, x, y, steps (`--seconds 20`) |
 | `test_audio_device.py` | audio device | Lists/finds the named output device via `sounddevice` |
 | `test_hrtf.py` | earphones | Plays HRTF warnings at left / ahead / right |
 | `test_pipeline_audio.py` | earphones | Same as above with console labels |

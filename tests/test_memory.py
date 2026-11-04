@@ -266,6 +266,27 @@ class TestRouteMemoryMatching(unittest.TestCase):
 
         self.assertNotEqual(pole.hazard_id, cone.hazard_id)
 
+    def test_persist_false_writes_nothing_but_returns_entry(self) -> None:
+        # Invalid pose: the planner still gets this frame's hazard, but the
+        # untrusted world position must not reach persistent memory.
+        memory = self._memory()
+        stored = memory.remember("pole-1", "pole", 0.0, 2.0, 0.9, timestamp=0.0)
+
+        entry = memory.remember(
+            "pole-1", "pole", 5.0, 5.0, 0.8, timestamp=1.0, persist=False
+        )
+        unknown = memory.remember(
+            "cone-3", "reflective_cone", 1.0, 1.0, 0.7, timestamp=1.0, persist=False
+        )
+
+        self.assertEqual((entry.world_x, entry.world_y), (5.0, 5.0))
+        self.assertEqual(entry.hazard_id, stored.hazard_id)  # known track
+        self.assertEqual(unknown.hazard_id, "")
+        hazards = memory.get_hazards()
+        self.assertEqual(len(hazards), 1)
+        self.assertEqual((hazards[0].world_x, hazards[0].world_y), (0.0, 2.0))
+        self.assertEqual(hazards[0].timestamp, 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

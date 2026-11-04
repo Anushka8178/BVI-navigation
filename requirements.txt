@@ -13,5 +13,8 @@ ultralytics>=8.3,<9
 # Configuration (config.yaml)
 pyyaml>=6,<7
 
+# Phone pose (SensorServer WebSocket)
+websocket-client>=1.6,<2
+
 # Testing
 pytest>=8,<9
