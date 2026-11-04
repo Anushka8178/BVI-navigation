@@ -41,8 +41,8 @@ pose:
   # Fallback step counter (accelerometer), used automatically when
   # step_detector has sent nothing for step_fallback_after_s. Needs a fast
   # accelerometer: set SensorServer's sampling rate to ~20000 us (50 Hz).
-  step_fallback_after_s: 5.0
-  step_threshold: 10.8       # m/s^2, peak of low-passed |acceleration|
+  step_fallback_after_s: 0.5
+  step_threshold: 10.5       # m/s^2, peak of low-passed |acceleration|
   step_min_gap_s: 0.3        # minimum time between two steps
   step_lowpass_tau_s: 0.08   # low-pass time constant
 
