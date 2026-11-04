@@ -423,13 +423,7 @@ def main() -> None:
     phone_pose: PhonePose | None = None
 
     if pose_mode == "phone":
-        phone_pose = PhonePose(
-            phone_ip=str(network_cfg["phone_ip"]),
-            sensor_port=int(network_cfg["sensor_port"]),
-            stride_m=float(pose_cfg["stride_m"]),
-            stale_after_s=float(pose_cfg["stale_after_s"]),
-            reconnect_delay_s=float(pose_cfg["reconnect_delay_s"]),
-        )
+        phone_pose = PhonePose.from_config(network_cfg, pose_cfg)
         print(
             "Connecting to phone sensors at "
             f"ws://{phone_pose.phone_ip}:{phone_pose.sensor_port} ..."

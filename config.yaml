@@ -38,6 +38,13 @@ pose:
   stale_after_s: 2.0         # no rotation data this long -> pose invalid
   reconnect_delay_s: 1.0     # wait between WebSocket reconnect attempts
   startup_wait_s: 3.0        # wait this long for the first heading
+  # Fallback step counter (accelerometer), used automatically when
+  # step_detector has sent nothing for step_fallback_after_s. Needs a fast
+  # accelerometer: set SensorServer's sampling rate to ~20000 us (50 Hz).
+  step_fallback_after_s: 5.0
+  step_threshold: 10.8       # m/s^2, peak of low-passed |acceleration|
+  step_min_gap_s: 0.3        # minimum time between two steps
+  step_lowpass_tau_s: 0.08   # low-pass time constant
 
 # ------------------------------------------------------------------
 # Perception

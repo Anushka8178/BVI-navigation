@@ -184,6 +184,7 @@ def localize_detection(pose: Pose, detection: Detection) -> LocalizedDetection:
 
 ROTATION_VECTOR = "android.sensor.rotation_vector"
 STEP_DETECTOR = "android.sensor.step_detector"
+ACCELEROMETER = "android.sensor.accelerometer"
 
 
 def _wrap_deg(angle: float) -> float:
@@ -236,11 +237,15 @@ class PhonePose:
     - Heading: from android.sensor.rotation_vector, relative to the heading
       at calibration, so the start direction is world +y and heading is
       clockwise from +y (CLAUDE.md convention).
-    - Position: each android.sensor.step_detector event moves the user
-      `stride_m` along the current heading.
+    - Position: each step moves the user `stride_m` along the current
+      heading. Steps come from android.sensor.step_detector; if it has sent
+      nothing for `step_fallback_after_s` (some phones never send it), steps
+      come from android.sensor.accelerometer instead: the acceleration
+      magnitude is low-passed and each peak above `step_threshold` (at
+      least `step_min_gap_s` after the previous one) is a step.
     - Validity: the pose is invalid before the first heading arrives, when
-      no rotation data has arrived for `stale_after_s`, and while the step
-      stream is disconnected (position would silently freeze).
+      no rotation data has arrived for `stale_after_s`, and when the active
+      step source is down (position would silently freeze).
 
     Each sensor has its own WebSocket in a background daemon thread that
     reconnects after a drop. All the logic is in `handle_message()`, which
@@ -254,6 +259,10 @@ class PhonePose:
         stride_m: float = 0.7,
         stale_after_s: float = 2.0,
         reconnect_delay_s: float = 1.0,
+        step_threshold: float = 10.8,
+        step_min_gap_s: float = 0.3,
+        step_fallback_after_s: float = 5.0,
+        step_lowpass_tau_s: float = 0.08,
         clock: Callable[[], float] = time.monotonic,
         log: Callable[[str], None] = print,
     ) -> None:
@@ -262,6 +271,10 @@ class PhonePose:
         self.stride_m = float(stride_m)
         self.stale_after_s = float(stale_after_s)
         self.reconnect_delay_s = float(reconnect_delay_s)
+        self.step_threshold = float(step_threshold)
+        self.step_min_gap_s = float(step_min_gap_s)
+        self.step_fallback_after_s = float(step_fallback_after_s)
+        self.step_lowpass_tau_s = float(step_lowpass_tau_s)
         self._clock = clock
         self._log = log
 
@@ -272,13 +285,45 @@ class PhonePose:
         self._heading_offset = 0.0
         self._calibrate_pending = True  # the first heading becomes 0
         self._last_rotation_time: float | None = None
-        self.step_count = 0
+        self.step_count = 0  # steps applied to the position
+        self.detector_steps = 0  # step_detector events received
+        self.accel_steps = 0  # peaks found in the accelerometer signal
         # No step socket until start(); tests feed messages directly.
         self._step_connected = True
+
+        # Step-source selection: step_detector counts as silent from start.
+        self._start_time = clock()
+        self._last_detector_time: float | None = None
+
+        # Accelerometer step counter (phone timestamps, seconds).
+        self._last_accel_time: float | None = None  # our clock, for staleness
+        self._accel_ts: float | None = None
+        self._accel_filtered = 0.0
+        self._accel_prev: float | None = None  # filtered value one sample ago
+        self._accel_prev_ts = 0.0
+        self._accel_prev2: float | None = None  # two samples ago
+        self._last_accel_step_ts: float | None = None
+        self.accel_rate_hz: float | None = None  # smoothed sample rate
 
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
         self._sockets: dict[str, Any] = {}
+
+    @classmethod
+    def from_config(cls, network_cfg: dict, pose_cfg: dict, **kwargs: Any) -> "PhonePose":
+        """Build from config.yaml's `network` and `pose` sections."""
+        return cls(
+            phone_ip=str(network_cfg["phone_ip"]),
+            sensor_port=int(network_cfg["sensor_port"]),
+            stride_m=float(pose_cfg["stride_m"]),
+            stale_after_s=float(pose_cfg["stale_after_s"]),
+            reconnect_delay_s=float(pose_cfg["reconnect_delay_s"]),
+            step_threshold=float(pose_cfg["step_threshold"]),
+            step_min_gap_s=float(pose_cfg["step_min_gap_s"]),
+            step_fallback_after_s=float(pose_cfg["step_fallback_after_s"]),
+            step_lowpass_tau_s=float(pose_cfg["step_lowpass_tau_s"]),
+            **kwargs,
+        )
 
     # -- Connection --------------------------------------------------------
 
@@ -289,7 +334,7 @@ class PhonePose:
         )
 
     def start(self) -> "PhonePose":
-        """Open both WebSockets in background threads. Returns self."""
+        """Open the sensor WebSockets in background threads. Returns self."""
         try:
             import websocket  # websocket-client
         except ImportError as error:
@@ -301,7 +346,7 @@ class PhonePose:
         with self._lock:
             self._step_connected = False
 
-        for sensor_type in (ROTATION_VECTOR, STEP_DETECTOR):
+        for sensor_type in (ROTATION_VECTOR, STEP_DETECTOR, ACCELEROMETER):
             thread = threading.Thread(
                 target=self._run_socket,
                 args=(websocket, sensor_type),
@@ -398,12 +443,93 @@ class PhonePose:
 
         elif sensor_type == STEP_DETECTOR:
             with self._lock:
-                if self._raw_heading is None:
-                    return  # direction unknown before the first heading
-                h = radians(_wrap_deg(self._raw_heading - self._heading_offset))
-                self._x += self.stride_m * sin(h)
-                self._y += self.stride_m * cos(h)
-                self.step_count += 1
+                self._last_detector_time = self._clock()
+                self.detector_steps += 1
+                self._advance_one_step()
+
+        elif sensor_type == ACCELEROMETER:
+            if len(values) < 3:
+                return
+            try:
+                phone_ts = float(data["timestamp"]) / 1e9
+            except (KeyError, TypeError, ValueError):
+                phone_ts = self._clock()
+            magnitude = sqrt(values[0] ** 2 + values[1] ** 2 + values[2] ** 2)
+            with self._lock:
+                self._last_accel_time = self._clock()
+                if self._accel_sample(magnitude, phone_ts):
+                    self.accel_steps += 1
+                    if self._step_source_locked() == ACCELEROMETER:
+                        self._advance_one_step()
+
+    def _advance_one_step(self) -> None:
+        """Move one stride along the current heading. Caller holds the lock."""
+        if self._raw_heading is None:
+            return  # direction unknown before the first heading
+        h = radians(_wrap_deg(self._raw_heading - self._heading_offset))
+        self._x += self.stride_m * sin(h)
+        self._y += self.stride_m * cos(h)
+        self.step_count += 1
+
+    def _accel_sample(self, magnitude: float, ts: float) -> bool:
+        """Low-pass one |acceleration| sample; True if it confirms a step.
+
+        A step is a local maximum of the filtered signal above
+        step_threshold, at least step_min_gap_s after the previous step.
+        It is confirmed one sample late (once the signal starts falling).
+        Caller holds the lock.
+        """
+        if self._accel_ts is None or ts - self._accel_ts > 1.0:
+            # First sample or a long gap (reconnect): restart the filter.
+            self._accel_filtered = magnitude
+            self._accel_prev = self._accel_prev2 = None
+            self._accel_ts = ts
+            return False
+        dt = ts - self._accel_ts
+        if dt <= 0.0:
+            return False  # duplicate or out-of-order sample
+        self._accel_ts = ts
+
+        rate = 1.0 / dt
+        self.accel_rate_hz = (
+            rate if self.accel_rate_hz is None else 0.9 * self.accel_rate_hz + 0.1 * rate
+        )
+        alpha = dt / (self.step_lowpass_tau_s + dt)
+        self._accel_filtered += alpha * (magnitude - self._accel_filtered)
+        current = self._accel_filtered
+
+        is_step = (
+            self._accel_prev is not None
+            and self._accel_prev2 is not None
+            and self._accel_prev > self.step_threshold
+            and self._accel_prev > self._accel_prev2
+            and self._accel_prev >= current
+            and (
+                self._last_accel_step_ts is None
+                or self._accel_prev_ts - self._last_accel_step_ts >= self.step_min_gap_s
+            )
+        )
+        if is_step:
+            self._last_accel_step_ts = self._accel_prev_ts
+
+        self._accel_prev2 = self._accel_prev
+        self._accel_prev = current
+        self._accel_prev_ts = ts
+        return is_step
+
+    def _step_source_locked(self) -> str:
+        reference = (
+            self._start_time if self._last_detector_time is None else self._last_detector_time
+        )
+        if self._clock() - reference < self.step_fallback_after_s:
+            return STEP_DETECTOR
+        return ACCELEROMETER
+
+    @property
+    def step_source(self) -> str:
+        """Active step source: "step_detector" or "accelerometer"."""
+        with self._lock:
+            return self._step_source_locked().rsplit(".", 1)[-1]
 
     def calibrate(self) -> None:
         """Make the current heading 0 (world +y). If no heading has arrived
@@ -418,10 +544,18 @@ class PhonePose:
     def get_pose(self, t: float) -> Pose:
         """Latest pose, stamped with the pipeline time `t`."""
         with self._lock:
+            now = self._clock()
             fresh = (
                 self._last_rotation_time is not None
-                and self._clock() - self._last_rotation_time <= self.stale_after_s
+                and now - self._last_rotation_time <= self.stale_after_s
             )
+            if self._step_source_locked() == STEP_DETECTOR:
+                steps_ok = self._step_connected
+            else:
+                steps_ok = (
+                    self._last_accel_time is not None
+                    and now - self._last_accel_time <= self.stale_after_s
+                )
             heading = (
                 0.0
                 if self._raw_heading is None
@@ -432,5 +566,5 @@ class PhonePose:
                 y=self._y,
                 heading_deg=heading,
                 timestamp=t,
-                valid=fresh and self._step_connected,
+                valid=fresh and steps_ok,
             )

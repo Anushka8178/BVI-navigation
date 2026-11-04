@@ -3,8 +3,12 @@
 import json
 from math import cos, isclose, radians, sin
 
+import random
+
+from navigation.config import load_config
 from navigation.models import Detection
 from navigation.sensing import (
+    ACCELEROMETER,
     ROTATION_VECTOR,
     STEP_DETECTOR,
     PhonePose,
@@ -56,10 +60,38 @@ class FakeClock:
         return self.now
 
 
-def make_pose(stride_m: float = 0.7):
+def make_pose(stride_m: float = 0.7, **kwargs):
     clock = FakeClock()
-    pose = PhonePose("10.0.0.1", 8081, stride_m=stride_m, stale_after_s=2.0, clock=clock)
+    pose = PhonePose(
+        "10.0.0.1", 8081, stride_m=stride_m, stale_after_s=2.0, clock=clock, **kwargs
+    )
     return pose, clock
+
+
+def accel_message(magnitude: float, t_s: float) -> str:
+    # Phone upright: gravity is mostly along device +Y; only |a| matters.
+    return json.dumps(
+        {"values": [0.3, magnitude * 0.98, magnitude * 0.199], "timestamp": int(t_s * 1e9)}
+    )
+
+
+def feed_accel(pose, clock, start_s, seconds, signal, rate_hz=50.0):
+    """Feed `signal(t)` (m/s^2) as accelerometer messages, advancing the clock."""
+    n = int(seconds * rate_hz)
+    for i in range(n):
+        t = start_s + i / rate_hz
+        clock.now = 100.0 + t
+        pose.handle_message(ACCELEROMETER, accel_message(signal(t), t))
+
+
+def walking(cadence_hz=1.8, amplitude=2.5, noise=0.3, seed=1):
+    """|acceleration| of a chest-mounted phone while walking: gravity plus
+    one bounce per step, plus sensor noise."""
+    rng = random.Random(seed)
+    return lambda t: (
+        9.81 + amplitude * sin(2 * 3.141592653589793 * cadence_hz * t)
+        + rng.uniform(-noise, noise)
+    )
 
 
 def test_heading_follows_camera_direction_clockwise():
@@ -172,3 +204,86 @@ def test_urls_use_configured_ip_and_port():
         "ws://10.47.242.217:8081/sensor/connect?type=android.sensor.rotation_vector"
     )
     assert pose.url(STEP_DETECTOR).endswith("type=android.sensor.step_detector")
+
+
+# -- Accelerometer fallback step counter ------------------------------------
+
+
+def test_accelerometer_counts_synthetic_walk():
+    pose, clock = make_pose()
+    pose.handle_message(ROTATION_VECTOR, chest_message(0))
+    # 10 s of walking at 1.8 steps/s, after step_detector has been silent 5 s.
+    feed_accel(pose, clock, start_s=5.0, seconds=10.0, signal=walking())
+
+    assert pose.step_source == "accelerometer"
+    assert abs(pose.accel_steps - 18) <= 1
+    assert pose.step_count == pose.accel_steps
+    p = pose.get_pose(0.0)
+    assert isclose(p.y, 0.7 * pose.step_count, abs_tol=1e-6)  # walked straight ahead
+    assert isclose(p.x, 0.0, abs_tol=1e-6)
+    pose.handle_message(ROTATION_VECTOR, chest_message(0))  # heading still streaming
+    assert pose.get_pose(0.0).valid
+    assert isclose(pose.accel_rate_hz, 50.0, rel_tol=0.01)
+
+
+def test_standing_still_counts_no_steps():
+    pose, clock = make_pose()
+    pose.handle_message(ROTATION_VECTOR, chest_message(0))
+    feed_accel(pose, clock, 5.0, 10.0, walking(amplitude=0.0, noise=0.4))
+    assert pose.accel_steps == 0
+
+
+def test_min_gap_between_steps():
+    # A 4 Hz bounce would be 40 steps in 10 s; the 0.3 s gap keeps every
+    # other peak (one per 0.5 s), so about 20.
+    pose, clock = make_pose()
+    feed_accel(pose, clock, 5.0, 10.0, walking(cadence_hz=4.0, amplitude=3.0, noise=0.0))
+    assert 19 <= pose.accel_steps <= 21
+
+
+def test_fallback_only_after_step_detector_silent_5_s():
+    pose, clock = make_pose()
+    pose.handle_message(ROTATION_VECTOR, chest_message(0))
+
+    feed_accel(pose, clock, 0.0, 4.5, walking())  # first 4.5 s: not yet
+    assert pose.step_source == "step_detector"
+    assert pose.accel_steps >= 7 and pose.step_count == 0
+
+    feed_accel(pose, clock, 4.5, 5.5, walking(seed=2))  # now the fallback is active
+    assert pose.step_source == "accelerometer"
+    applied = pose.step_count
+    assert applied > 0
+
+    # step_detector wakes up: it takes over, accelerometer peaks are ignored.
+    pose.handle_message(STEP_DETECTOR, STEP)
+    assert pose.step_source == "step_detector"
+    assert pose.step_count == applied + 1
+    feed_accel(pose, clock, 10.0, 3.0, walking(seed=3))
+    assert pose.step_count == applied + 1
+
+    clock.now += 5.0  # silent again for 5 s: back to the fallback
+    assert pose.step_source == "accelerometer"
+
+
+def test_fallback_pose_invalid_when_accelerometer_stops():
+    pose, clock = make_pose()
+    feed_accel(pose, clock, 5.0, 1.0, walking())
+    pose.handle_message(ROTATION_VECTOR, chest_message(0))
+    assert pose.step_source == "accelerometer" and pose.get_pose(0.0).valid
+
+    clock.now += 1.0
+    pose.handle_message(ROTATION_VECTOR, chest_message(0))  # heading still fine
+    clock.now += 1.5  # accelerometer silent 2.5 s
+    pose.handle_message(ROTATION_VECTOR, chest_message(0))
+    assert not pose.get_pose(0.0).valid
+
+
+def test_from_config_uses_repo_config():
+    config = load_config()
+    pose = PhonePose.from_config(config["network"], config["pose"])
+    assert pose.step_threshold == 10.8
+    assert pose.step_min_gap_s == 0.3
+    assert pose.step_fallback_after_s == 5.0
+    assert pose.url(ACCELEROMETER) == (
+        "ws://10.47.242.217:8081/sensor/connect?type=android.sensor.accelerometer"
+    )
