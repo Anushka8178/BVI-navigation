@@ -89,3 +89,27 @@ def test_auto_choice_skips_wdm_ks_headphones():
 def test_wdm_ks_used_if_nothing_else():
     devices = [dev("Headphones (Realtek)") | {"hostapi_name": "Windows WDM-KS"}]
     assert choose_output_device(devices, None)[0] == 0
+
+
+def test_keywords_from_config_are_used():
+    from navigation.config import load_config
+
+    audio = load_config()["audio"]
+    devices = [dev("Speakers (Realtek)"), dev("Earphones (Jabra Wired)"), dev("Jabra Elite (BT)")]
+    index, reason = choose_output_device(
+        devices,
+        default_output=0,
+        bluetooth_keywords=audio["bluetooth_keywords"],
+        headphone_keywords=audio["headphone_keywords"],
+    )
+    assert (index, reason) == (1, "wired headphones")
+
+    # A custom Bluetooth keyword ("jabra") now rules out both Jabra devices.
+    index, _ = choose_output_device(
+        devices,
+        default_output=None,
+        bluetooth_keywords=["jabra"],
+        headphone_keywords=audio["headphone_keywords"],
+    )
+    assert index == 0
+    assert is_bluetooth_name("Jabra Elite (BT)", keywords=["JABRA"])

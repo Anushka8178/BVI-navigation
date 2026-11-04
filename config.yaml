@@ -1,0 +1,104 @@
+# BVI navigation - every tunable number lives here.
+# Loaded once by navigation/config.py and passed to the constructors.
+# Override any value from the command line, e.g.
+#   --set planner.safety_margin_m=0.30 --set network.phone_ip=192.168.43.1
+
+# ------------------------------------------------------------------
+# Input
+# ------------------------------------------------------------------
+camera:
+  # Default --source: IP Webcam app on the chest-mounted phone (MJPEG).
+  # Pass --source videos\street6.mp4 to run on a recorded video instead.
+  source: http://10.47.242.217:8080/video
+  # URL streams only: give up if no new frame arrives for this long.
+  read_timeout_s: 5.0
+  # URL streams only: wait between reconnect attempts after a dropout.
+  reconnect_delay_s: 1.0
+  # URL streams only: frame rate written into the annotated output video.
+  live_output_fps: 15.0
+  # Print processing FPS this often.
+  fps_report_interval_s: 5.0
+
+# ------------------------------------------------------------------
+# Network (Android rig: laptop on the phone's hotspot)
+# ------------------------------------------------------------------
+network:
+  phone_ip: 10.47.242.217
+  sensor_port: 8081          # SensorServer WebSocket port
+  esp32_ip: 192.168.43.50    # ESP32 (HC-SR04 + vibration motor)
+  esp32_distance_port: 5005  # ESP32 -> laptop: "D,<cm>,<millis>"
+  esp32_vibration_port: 5006 # laptop -> ESP32: "V,<ms>"
+
+# ------------------------------------------------------------------
+# Perception
+# ------------------------------------------------------------------
+perception:
+  confidence: 0.35
+  device: cpu                # "cpu" or a CUDA index such as "0"
+
+# ------------------------------------------------------------------
+# Hazard severity (navigation/hazard.py)
+# ------------------------------------------------------------------
+hazard:
+  urgency_threshold: 0.72
+  directly_ahead_deg: 20.0
+  very_close_m: 2.5
+  immediate_close_m: 1.5
+  critical_ttc_s: 1.5
+  high_risk_ttc_s: 2.5
+
+# ------------------------------------------------------------------
+# Local path planner (navigation/planner.py)
+# safety_margin_m = 0.25 as on the path-planner-hrtf-updated branch.
+# ------------------------------------------------------------------
+planner:
+  horizon_m: 5.0
+  path_width_m: 0.65
+  safety_margin_m: 0.25
+  walking_speed_m_s: 0.5
+  prediction_horizon_s: 4.0
+  prediction_step_s: 0.25
+  static_action_distance_m: 2.75
+  dynamic_action_distance_m: 6.0
+  dynamic_ttc_s: 4.0
+  confirm_frames: 3
+  clear_frames: 3
+
+# ------------------------------------------------------------------
+# Hazard trajectory / velocity (navigation/trajectory.py)
+# ------------------------------------------------------------------
+trajectory:
+  smoothing: 0.35
+  max_speed_m_s: 8.0
+
+# ------------------------------------------------------------------
+# Persistent route memory (navigation/memory.py)
+# ------------------------------------------------------------------
+memory:
+  db_path: navigation_memory.db
+  decay_half_life_s: 30.0
+  min_decay_weight: 0.05
+  max_entries: 500
+  match_radius_m: 1.0
+  dynamic_labels: [person, dog, bicycle, car, bus, truck, motorbike, tricycle]
+
+# ------------------------------------------------------------------
+# Acoustic attention (navigation/reasoning.py)
+# ------------------------------------------------------------------
+attention:
+  top_k: 3
+  weights: [0.45, 0.25, 0.30]  # distance, alignment, recency
+
+# ------------------------------------------------------------------
+# HRTF audio (navigation/hrtf_renderer.py)
+# ------------------------------------------------------------------
+audio:
+  hrtf_path: hrtf/mit_kemar_normal_pinna.sofa
+  device: null                 # index or name fragment; null = automatic
+  warning_cooldown_s: 0.8      # urgent cues
+  path_guidance_cooldown_s: 1.0
+  max_queue: 2
+  # Names containing these are Bluetooth (100-250 ms extra latency, used last).
+  bluetooth_keywords: [bluetooth, hands-free, handsfree, a2dp, airpods, buds, enco]
+  # Names containing these (and no Bluetooth keyword) are wired headphones.
+  headphone_keywords: [headphone, earphone, headset]

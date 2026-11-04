@@ -34,9 +34,9 @@ HEADPHONE_KEYWORDS = (
 )
 
 
-def is_bluetooth_name(name: str) -> bool:
+def is_bluetooth_name(name: str, keywords=BLUETOOTH_KEYWORDS) -> bool:
     lowered = name.lower()
-    return any(keyword in lowered for keyword in BLUETOOTH_KEYWORDS)
+    return any(keyword.lower() in lowered for keyword in keywords)
 
 
 def _is_output(device) -> bool:
@@ -48,7 +48,13 @@ def _is_raw_host_api(device) -> bool:
     return "wdm-ks" in str(device.get("hostapi_name", "")).lower()
 
 
-def choose_output_device(devices, default_output=None, requested=None):
+def choose_output_device(
+    devices,
+    default_output=None,
+    requested=None,
+    bluetooth_keywords=BLUETOOTH_KEYWORDS,
+    headphone_keywords=HEADPHONE_KEYWORDS,
+):
     """Pick an output device index from sounddevice-style device dicts.
 
     requested:
@@ -120,8 +126,8 @@ def choose_output_device(devices, default_output=None, requested=None):
     for index, device in outputs:
         name = device["name"].lower()
         if (
-            any(keyword in name for keyword in HEADPHONE_KEYWORDS)
-            and not is_bluetooth_name(name)
+            any(keyword.lower() in name for keyword in headphone_keywords)
+            and not is_bluetooth_name(name, bluetooth_keywords)
         ):
             return index, "wired headphones"
 
@@ -129,12 +135,14 @@ def choose_output_device(devices, default_output=None, requested=None):
         default_output is not None
         and 0 <= int(default_output) < len(devices)
         and _is_output(devices[int(default_output)])
-        and not is_bluetooth_name(devices[int(default_output)]["name"])
+        and not is_bluetooth_name(
+            devices[int(default_output)]["name"], bluetooth_keywords
+        )
     ):
         return int(default_output), "system default output"
 
     for index, device in outputs:
-        if not is_bluetooth_name(device["name"]):
+        if not is_bluetooth_name(device["name"], bluetooth_keywords):
             return index, "first non-Bluetooth output"
 
     return outputs[0][0], (
@@ -217,6 +225,9 @@ class HRTFRenderer:
         warning_cooldown=0.8,
         backend=None,
         max_queue=2,
+        path_guidance_cooldown=1.0,
+        bluetooth_keywords=BLUETOOTH_KEYWORDS,
+        headphone_keywords=HEADPHONE_KEYWORDS,
     ):
         print("Loading HRTF file...")
 
@@ -246,7 +257,9 @@ class HRTFRenderer:
         # Soft path-guidance cooldown
         # --------------------------------------------------
 
-        self.path_guidance_cooldown = 1.0
+        self.path_guidance_cooldown = float(
+            path_guidance_cooldown
+        )
         self.last_path_guidance_time = 0.0
 
         # --------------------------------------------------
@@ -254,6 +267,9 @@ class HRTFRenderer:
         # --------------------------------------------------
 
         use_sounddevice = backend is None
+
+        self.bluetooth_keywords = tuple(bluetooth_keywords)
+        self.headphone_keywords = tuple(headphone_keywords)
 
         self.backend = (
             SoundDeviceBackend()
@@ -374,6 +390,8 @@ class HRTFRenderer:
                 devices,
                 default_output,
                 requested,
+                self.bluetooth_keywords,
+                self.headphone_keywords,
             )
         except (ValueError, RuntimeError) as error:
             raise RuntimeError(
@@ -386,7 +404,9 @@ class HRTFRenderer:
             f"({devices[index]['name']}): {reason}"
         )
 
-        if is_bluetooth_name(devices[index]["name"]):
+        if is_bluetooth_name(
+            devices[index]["name"], self.bluetooth_keywords
+        ):
             print(
                 "WARNING: Bluetooth audio adds about 100-250 ms of "
                 "latency. Use wired earphones for the demo."

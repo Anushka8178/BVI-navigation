@@ -10,5 +10,8 @@ sofar>=1.2,<2
 opencv-python>=4.10,<5
 ultralytics>=8.3,<9
 
+# Configuration (config.yaml)
+pyyaml>=6,<7
+
 # Testing
 pytest>=8,<9

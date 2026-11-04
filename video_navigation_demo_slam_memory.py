@@ -14,13 +14,16 @@ Pipeline:
 Important:
     Pose/localization is simulated in this prototype. It is not real SLAM.
 
-Example:
-    python video_navigation_demo_slam_memory.py \
-        --weights best.pt \
-        --source videos\\street6.mp4 \
-        --output videos\\street6_navigation.mp4 \
-        --device cpu \
-        --reset
+All tunables come from config.yaml (see --config). Dedicated flags such as
+--confidence, and any number of --set section.key=value, override it.
+
+Examples (PowerShell):
+    # Recorded video
+    python video_navigation_demo_slam_memory.py --weights best.pt `
+        --source videos\\street6.mp4 --output videos\\street6_navigation.mp4 --reset
+
+    # Live phone camera (IP Webcam app); default source is camera.source
+    python video_navigation_demo_slam_memory.py --weights best.pt --no-display
 """
 
 from __future__ import annotations
@@ -36,6 +39,13 @@ import numpy as np
 from numpy.typing import NDArray
 
 from navigation.audio import make_warning
+from navigation.camera import FpsMeter, is_url, open_source
+from navigation.config import (
+    ConfigError,
+    apply_overrides,
+    load_config,
+    parse_set_option,
+)
 from navigation.hazard import HazardSeverityClassifier
 from navigation.hrtf_renderer import HRTFRenderer
 from navigation.memory import RouteMemory
@@ -187,33 +197,49 @@ def main() -> None:
         help="YOLO weights, e.g. best.pt",
     )
     parser.add_argument(
-        "--source",
+        "--config",
         type=Path,
-        required=True,
-        help="Input recorded video",
+        default=None,
+        help="Config file (default: config.yaml in the repo root)",
+    )
+    parser.add_argument(
+        "--set",
+        dest="overrides",
+        action="append",
+        default=[],
+        metavar="SECTION.KEY=VALUE",
+        help="Override a config value, e.g. --set planner.safety_margin_m=0.3 "
+        "(repeatable)",
+    )
+    parser.add_argument(
+        "--source",
+        default=None,
+        help="Recorded video file OR stream URL, e.g. "
+        "http://<PHONE_IP>:8080/video (default: camera.source in config)",
     )
     parser.add_argument(
         "--output",
         type=Path,
-        required=True,
-        help="Annotated output video",
+        default=None,
+        help="Annotated output video (default: <video>_navigation.mp4, or "
+        "videos/live_<time>_navigation.mp4 for a URL)",
     )
     parser.add_argument(
         "--confidence",
         type=float,
-        default=0.35,
-        help="YOLO confidence threshold",
+        default=None,
+        help="YOLO confidence threshold (config: perception.confidence)",
     )
     parser.add_argument(
         "--device",
-        default="cpu",
-        help="YOLO device, e.g. cpu or 0",
+        default=None,
+        help="YOLO device, e.g. cpu or 0 (config: perception.device)",
     )
     parser.add_argument(
         "--db",
         type=Path,
-        default=Path("navigation_memory.db"),
-        help="SQLite navigation memory database",
+        default=None,
+        help="SQLite navigation memory database (config: memory.db_path)",
     )
     parser.add_argument(
         "--reset",
@@ -223,19 +249,26 @@ def main() -> None:
     parser.add_argument(
         "--hrtf",
         type=Path,
-        default=Path("hrtf/mit_kemar_normal_pinna.sofa"),
-        help="SOFA HRTF file",
+        default=None,
+        help="SOFA HRTF file (config: audio.hrtf_path)",
     )
     parser.add_argument(
         "--audio-device",
         default=None,
         help="Audio output device index or name "
-        "(default: wired headphones, Bluetooth last)",
+        "(config: audio.device; default: wired headphones, Bluetooth last)",
     )
     parser.add_argument(
         "--no-audio",
         action="store_true",
         help="Disable HRTF audio",
+    )
+    parser.add_argument(
+        "--max-seconds",
+        type=float,
+        default=None,
+        help="Stop cleanly after this many seconds of processing "
+        "(useful for timed live runs)",
     )
     parser.add_argument(
         "--no-display",
@@ -245,83 +278,104 @@ def main() -> None:
 
     args = parser.parse_args()
 
+    try:
+        config = apply_overrides(
+            load_config(args.config),
+            [parse_set_option(text) for text in args.overrides],
+        )
+        # Dedicated flags win over both config.yaml and --set.
+        config = apply_overrides(
+            config,
+            {
+                "camera.source": args.source,
+                "perception.confidence": args.confidence,
+                "perception.device": args.device,
+                "memory.db_path": None if args.db is None else str(args.db),
+                "audio.hrtf_path": None if args.hrtf is None else str(args.hrtf),
+                "audio.device": args.audio_device,
+            },
+        )
+    except ConfigError as error:
+        raise SystemExit(f"Config error: {error}") from error
+
+    camera_cfg = config["camera"]
+    perception_cfg = config["perception"]
+    memory_cfg = config["memory"]
+    attention_cfg = config["attention"]
+    audio_cfg = config["audio"]
+
+    source = str(camera_cfg["source"])
+    live = is_url(source)
+    db_path = Path(memory_cfg["db_path"])
+    hrtf_path = Path(audio_cfg["hrtf_path"])
+
+    if args.output is not None:
+        output_path = args.output
+    elif live:
+        output_path = Path("videos") / (
+            f"live_{time.strftime('%Y%m%d_%H%M%S')}_navigation.mp4"
+        )
+    else:
+        source_path = Path(source)
+        output_path = source_path.with_name(
+            f"{source_path.stem}_navigation.mp4"
+        )
+
     if not args.weights.exists():
         raise SystemExit(
             f"Trained model does not exist: {args.weights.resolve()}"
         )
 
-    if not args.source.exists():
+    if not args.no_audio and not hrtf_path.exists():
         raise SystemExit(
-            f"Input video does not exist: {args.source.resolve()}"
+            f"HRTF SOFA file does not exist: {hrtf_path.resolve()}"
         )
 
-    if not args.no_audio and not args.hrtf.exists():
-        raise SystemExit(
-            f"HRTF SOFA file does not exist: {args.hrtf.resolve()}"
-        )
-
-    capture = cv2.VideoCapture(str(args.source))
-    if not capture.isOpened():
-        raise SystemExit(
-            f"Could not open input video: {args.source.resolve()}"
-        )
-
-    fps = float(capture.get(cv2.CAP_PROP_FPS)) or 30.0
-    frame_width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
-    frame_height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-    if frame_width <= 0 or frame_height <= 0:
-        capture.release()
-        raise SystemExit("Could not determine the video's frame size.")
-
+    print(f"Opening source: {source}")
     try:
-        writer = create_writer(
-            args.output,
-            fps,
-            (frame_width, frame_height),
+        frame_source = open_source(
+            source,
+            read_timeout_s=camera_cfg["read_timeout_s"],
+            reconnect_delay_s=camera_cfg["reconnect_delay_s"],
         )
     except RuntimeError as error:
-        capture.release()
         raise SystemExit(str(error)) from error
+
+    if live:
+        fps = float(frame_source.fps or camera_cfg["live_output_fps"])
+    else:
+        fps = frame_source.fps
+
+    # The writer is created on the first frame, because a stream's frame
+    # size is only known once a frame has arrived.
+    writer: cv2.VideoWriter | None = None
 
     print("\nInitializing navigation pipeline...\n")
 
     perception = YOLOPerception(
         weights=args.weights,
-        confidence=args.confidence,
-        device=args.device,
+        confidence=float(perception_cfg["confidence"]),
+        device=str(perception_cfg["device"]),
     )
 
-    severity = HazardSeverityClassifier(
-        urgency_threshold=0.72,
-        directly_ahead_deg=20.0,
-        very_close_m=2.5,
-        immediate_close_m=1.5,
-        critical_ttc_s=1.5,
-        high_risk_ttc_s=2.5,
+    severity = HazardSeverityClassifier(**config["hazard"])
+
+    memory = RouteMemory(
+        str(db_path),
+        decay_half_life_s=float(memory_cfg["decay_half_life_s"]),
+        min_decay_weight=float(memory_cfg["min_decay_weight"]),
+        max_entries=int(memory_cfg["max_entries"]),
+        match_radius_m=float(memory_cfg["match_radius_m"]),
+        dynamic_labels=frozenset(memory_cfg["dynamic_labels"]),
+    )
+    attention = AcousticAttention(
+        top_k=int(attention_cfg["top_k"]),
+        weights=tuple(float(w) for w in attention_cfg["weights"]),
     )
 
-    memory = RouteMemory(str(args.db))
-    attention = AcousticAttention(top_k=3)
+    planner = LocalPathPlanner(**config["planner"])
 
-    planner = LocalPathPlanner(
-        horizon_m=5.0,
-        path_width_m=0.65,
-        safety_margin_m=0.25,
-        walking_speed_m_s=0.5,
-        prediction_horizon_s=4.0,
-        prediction_step_s=0.25,
-        static_action_distance_m=2.75,
-        dynamic_action_distance_m=6.0,
-        dynamic_ttc_s=4.0,
-        confirm_frames=3,
-        clear_frames=3,
-    )
-
-    trajectory_tracker = HazardTrajectoryTracker(
-        smoothing=0.35,
-        max_speed_m_s=8.0,
-    )
+    trajectory_tracker = HazardTrajectoryTracker(**config["trajectory"])
 
     hrtf_renderer: HRTFRenderer | None = None
 
@@ -330,10 +384,18 @@ def main() -> None:
 
         try:
             hrtf_renderer = HRTFRenderer(
-                sofa_path=str(args.hrtf),
-                output_device=args.audio_device,
+                sofa_path=str(hrtf_path),
+                output_device=audio_cfg["device"],
+                warning_cooldown=float(audio_cfg["warning_cooldown_s"]),
+                path_guidance_cooldown=float(
+                    audio_cfg["path_guidance_cooldown_s"]
+                ),
+                max_queue=int(audio_cfg["max_queue"]),
+                bluetooth_keywords=audio_cfg["bluetooth_keywords"],
+                headphone_keywords=audio_cfg["headphone_keywords"],
             )
         except RuntimeError as error:
+            frame_source.close()
             raise SystemExit(f"Audio setup failed: {error}")
         print("HRTF spatial audio initialized.\n")
     else:
@@ -342,7 +404,7 @@ def main() -> None:
     if args.reset:
         memory.clear()
         print(
-            f"Cleared persistent memory: {args.db.resolve()}"
+            f"Cleared persistent memory: {db_path.resolve()}"
         )
 
     frame_id = 0
@@ -356,11 +418,27 @@ def main() -> None:
     path_events: list[dict[str, Any]] = []
 
     processing_started = time.perf_counter()
+    fps_meter = FpsMeter(camera_cfg["fps_report_interval_s"])
+    last_received = 0
+    last_dropped = 0
+    first_timestamp: float | None = None
 
     try:
         while True:
-            success, captured_image = capture.read()
-            if not success or captured_image is None:
+            if (
+                args.max_seconds is not None
+                and time.perf_counter() - processing_started >= args.max_seconds
+            ):
+                print(f"Reached --max-seconds {args.max_seconds}; stopping.")
+                break
+
+            captured_image, source_timestamp = frame_source.read()
+            if captured_image is None or source_timestamp is None:
+                if live:
+                    print(
+                        "No new camera frame for "
+                        f"{camera_cfg['read_timeout_s']} s; stopping."
+                    )
                 break
 
             image: ImageArray = np.asarray(
@@ -368,8 +446,26 @@ def main() -> None:
                 dtype=np.uint8,
             )
 
+            if writer is None:
+                frame_height, frame_width = image.shape[:2]
+                try:
+                    writer = create_writer(
+                        output_path,
+                        fps,
+                        (frame_width, frame_height),
+                    )
+                except RuntimeError as error:
+                    raise SystemExit(str(error)) from error
+
+            if first_timestamp is None:
+                first_timestamp = source_timestamp
+
             frame_id += 1
-            timestamp = (frame_id - 1) / fps
+            # Video time for files, wall-clock time for live streams.
+            # Tracking, TTC and memory decay all use this clock.
+            timestamp = source_timestamp
+            # Seconds since the first frame (simulated pose and report).
+            elapsed_s = source_timestamp - first_timestamp
 
             frame_packet = FramePacket(
                 frame_id=frame_id,
@@ -377,7 +473,7 @@ def main() -> None:
                 image=image,
             )
 
-            pose = simulated_pose(timestamp)
+            pose = simulated_pose(elapsed_s)
             detections = perception.process(frame_packet)
 
             # -------------------------------------------------
@@ -512,7 +608,7 @@ def main() -> None:
                 path_events.append(
                     {
                         "frame": frame_id,
-                        "time_s": round(timestamp, 3),
+                        "time_s": round(elapsed_s, 3),
                         "current_path_safe": False,
                         "recommended_path": path_decision.selected_path,
                         "recommended_offset_m": round(
@@ -572,7 +668,7 @@ def main() -> None:
                     warning_events.append(
                         {
                             "frame": frame_id,
-                            "time_s": round(timestamp, 3),
+                            "time_s": round(elapsed_s, 3),
                             "object_id": warning.object_id,
                             "label": warning.label,
                             "direction": warning.direction,
@@ -615,7 +711,7 @@ def main() -> None:
                     )
 
                     print(
-                        f"WARNING | t={timestamp:.2f}s | "
+                        f"WARNING | t={elapsed_s:.2f}s | "
                         f"{warning.label} | {warning.direction} | "
                         f"{warning.distance_m:.1f}m | "
                         f"{warning.category} | TTC={ttc_text} | "
@@ -624,6 +720,20 @@ def main() -> None:
                         f"audio_azimuth={warning.azimuth_deg * -2.5:+.1f}°"
                     )
                     
+
+            measured_fps = fps_meter.tick()
+            if measured_fps is not None:
+                line = f"FPS | pipeline {measured_fps:5.1f}"
+                if live:
+                    interval = fps_meter.interval_s
+                    received = frame_source.frames_received
+                    dropped = frame_source.frames_dropped
+                    line += (
+                        f" | camera {(received - last_received) / interval:5.1f}"
+                        f" | skipped stale frames {dropped - last_dropped}"
+                    )
+                    last_received, last_dropped = received, dropped
+                print(line, flush=True)
 
             if not args.no_display:
                 cv2.imshow(
@@ -635,9 +745,13 @@ def main() -> None:
                     print("Processing stopped by user.")
                     break
 
+    except KeyboardInterrupt:
+        print("Processing stopped by user (Ctrl+C).")
+
     finally:
-        capture.release()
-        writer.release()
+        frame_source.close()
+        if writer is not None:
+            writer.release()
         cv2.destroyAllWindows()
 
         if hrtf_renderer is not None:
@@ -647,12 +761,14 @@ def main() -> None:
     persisted_hazards = memory.get_hazards()
 
     report = {
-        "source_video": str(args.source.resolve()),
+        "source_video": source if live else str(Path(source).resolve()),
+        "live_source": live,
         "model_weights": str(args.weights.resolve()),
-        "annotated_video": str(args.output.resolve()),
-        "memory_db": str(args.db.resolve()),
+        "annotated_video": str(output_path.resolve()),
+        "memory_db": str(db_path.resolve()),
+        "config": config,
         "hrtf_file": (
-            str(args.hrtf.resolve())
+            str(hrtf_path.resolve())
             if not args.no_audio
             else None
         ),
@@ -665,6 +781,11 @@ def main() -> None:
         "unique_warning_objects": len(unique_warning_ids),
         "path_unsafe_frames": path_unsafe_frames,
         "processing_seconds": round(processing_seconds, 3),
+        "average_fps": (
+            round(frame_id / processing_seconds, 2)
+            if processing_seconds > 0
+            else None
+        ),
         "path_events": path_events,
         "warning_events": warning_events,
         "persistent_memory": [
@@ -703,7 +824,7 @@ def main() -> None:
         ],
     }
 
-    report_path = args.output.with_suffix(".json")
+    report_path = output_path.with_suffix(".json")
     report_path.write_text(
         json.dumps(report, indent=2),
         encoding="utf-8",
@@ -720,9 +841,10 @@ def main() -> None:
     print(f"HRTF warnings played: {audio_warning_count}")
     print(f"Path-unsafe frames: {path_unsafe_frames}")
     print(f"Path guidance HRTF warnings played: {path_warning_audio_count}")
-    print(f"Annotated video: {args.output.resolve()}")
+    print(f"Average FPS: {report['average_fps']}")
+    print(f"Annotated video: {output_path.resolve()}")
     print(f"JSON report: {report_path.resolve()}")
-    print(f"Memory DB: {args.db.resolve()}")
+    print(f"Memory DB: {db_path.resolve()}")
     print("=" * 60)
 
 
