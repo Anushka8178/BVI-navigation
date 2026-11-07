@@ -404,3 +404,10 @@ What changed
   ground-level visibility, simulation-only evaluation, pose quality for memory.
 
 Result: `python -m pytest -q` gives **217 passed**.
+
+## Push
+
+`git push -u origin memory-novelty` **succeeded**. Note that `origin` here is the fork
+`https://github.com/Anushka8178/BVI-navigation` (not `ManishAdithya/BVI-navigation`). Nothing was
+pushed to `main`. A PR can be opened from
+`https://github.com/Anushka8178/BVI-navigation/pull/new/memory-novelty`.
