@@ -17,8 +17,10 @@ def test_repo_config_loads_with_planner_branch_safety_margin():
     config = load_config()
     assert config["planner"]["safety_margin_m"] == 0.25
     assert config["camera"]["source"] == "http://10.47.242.217:8080/video"
-    assert config["network"]["esp32_distance_port"] == 5005
-    assert config["network"]["esp32_vibration_port"] == 5006
+    assert config["esp32"]["serial_port"] == "COM5"
+    assert config["esp32"]["baud"] == 115200
+    assert config["esp32"]["stale_after_s"] == 0.3
+    assert not any(key.startswith("esp32") for key in config["network"])
     assert config["memory"]["match_radius_m"] == 1.0
     assert config["network"]["phone_ip"] == "10.47.242.217"
     assert config["network"]["sensor_port"] == 8081

@@ -21,6 +21,7 @@ DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.yaml"
 REQUIRED_SECTIONS = (
     "camera",
     "network",
+    "esp32",
     "pose",
     "perception",
     "hazard",

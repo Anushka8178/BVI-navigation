@@ -55,6 +55,7 @@ from navigation.hrtf_renderer import HRTFRenderer
 from navigation.memory import RouteMemory
 from navigation.models import FramePacket, Pose
 from navigation.planner import LocalPathPlanner
+from navigation.range_sensor import RangeSensor
 from navigation.reasoning import AcousticAttention
 from navigation.sensing import PhonePose, localize_detection, simulated_pose
 from navigation.trajectory import HazardTrajectoryTracker
@@ -276,6 +277,16 @@ def main() -> None:
         help="Disable HRTF audio",
     )
     parser.add_argument(
+        "--no-esp32",
+        action="store_true",
+        help="Do not use the ESP32 ultrasonic range sensor",
+    )
+    parser.add_argument(
+        "--esp32-port",
+        default=None,
+        help="ESP32 serial port, e.g. COM5 (config: esp32.serial_port)",
+    )
+    parser.add_argument(
         "--max-seconds",
         type=float,
         default=None,
@@ -308,6 +319,7 @@ def main() -> None:
                 "memory.db_path": None if args.db is None else str(args.db),
                 "audio.hrtf_path": None if args.hrtf is None else str(args.hrtf),
                 "audio.device": args.audio_device,
+                "esp32.serial_port": args.esp32_port,
             },
         )
     except ConfigError as error:
@@ -448,6 +460,17 @@ def main() -> None:
             )
     else:
         print("Pose: simulated walk (--pose sim).\n")
+
+    # Range sensor: started and stopped only for now (fusion comes later).
+    # A missing port prints one warning; the run continues without it.
+    range_sensor: RangeSensor | None = None
+
+    if not args.no_esp32:
+        range_sensor = RangeSensor.from_config(config["esp32"])
+        print(f"Starting ESP32 range sensor on {range_sensor.serial_port} ...\n")
+        range_sensor.start()
+    else:
+        print("ESP32 range sensor disabled (--no-esp32).\n")
 
     if args.reset:
         memory.clear()
@@ -826,6 +849,9 @@ def main() -> None:
 
         if phone_pose is not None:
             phone_pose.close()
+
+        if range_sensor is not None:
+            range_sensor.close()
 
     processing_seconds = time.perf_counter() - processing_started
     persisted_hazards = memory.get_hazards()

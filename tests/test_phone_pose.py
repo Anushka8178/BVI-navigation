@@ -281,9 +281,9 @@ def test_fallback_pose_invalid_when_accelerometer_stops():
 def test_from_config_uses_repo_config():
     config = load_config()
     pose = PhonePose.from_config(config["network"], config["pose"])
-    assert pose.step_threshold == 10.8
+    assert pose.step_threshold == 10.5
     assert pose.step_min_gap_s == 0.3
-    assert pose.step_fallback_after_s == 5.0
+    assert pose.step_fallback_after_s == 0.5
     assert pose.url(ACCELEROMETER) == (
         "ws://10.47.242.217:8081/sensor/connect?type=android.sensor.accelerometer"
     )

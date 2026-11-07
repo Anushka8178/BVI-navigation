@@ -16,15 +16,22 @@ big refactors. Do not add heavy new dependencies. Do not rewrite modules that al
   and `...type=android.sensor.step_detector`. Each message is JSON with `values` (floats) and
   `timestamp` (ns).
 - **Range sensor:** an ESP32 with an HC-SR04 ultrasonic sensor (2–400 cm, 15° cone), mounted at chest height
-  facing forward, next to the phone camera. The ESP32 also drives a vibration motor.
+  facing forward, next to the phone camera, connected to the laptop by **USB serial**. There is
+  **no vibration motor**.
 - **Compute:** a Windows laptop (RTX 3050) runs this Python pipeline. The laptop is connected to the phone's hotspot.
 - **Audio:** HRTF cues from the laptop through **wired** earphones. Avoid Bluetooth, which adds about 100–250 ms.
 
-### ESP32 ⇄ laptop protocol (UDP, plain ASCII, one message per datagram)
-- ESP32 → laptop port **5005**: `D,<distance_cm>,<esp_millis>` about 15 times a second.
-  If there's no echo, send `D,-1,<esp_millis>`.
-- Laptop → ESP32 port **5006**: `V,<duration_ms>` vibrates the motor; `V,0` stops it.
-- The ESP32 IP and the ports must be configurable (in `config.yaml`, never hard-coded in logic).
+### ESP32 → laptop protocol (USB serial, 115200 baud, plain ASCII, one line per reading)
+- Firmware: `firmware/esp32_range/esp32_range.ino` (Arduino IDE, board "ESP32 Dev Module").
+- ESP32 prints `D,<distance_cm>,<esp_millis>` about 15 times a second (median of 3 pings).
+  If there's no echo, it prints `D,-1,<esp_millis>`. Other lines (boot messages) are ignored.
+- One-way only: the laptop sends nothing to the ESP32.
+- Wiring (sensor powered from 3V3, so no voltage divider; the 220R is series protection only):
+  HC-SR04 VCC → ESP32 3V3, GND → GND, Trig → GPIO5, Echo → 220R → GPIO18.
+- Laptop side: `navigation/range_sensor.py` (`RangeSensor`, pyserial background thread);
+  `latest_m()` returns None if the reading is older than 300 ms or is -1.
+- The serial port and baud are configurable in `config.yaml` (`esp32:` section, default `COM5`;
+  `--esp32-port` overrides), never hard-coded in logic. Check with `scripts/manual/check_esp32.py`.
 
 ## Repository facts
 - Main repo: `ManishAdithya/BVI-navigation`, branch `main`.
