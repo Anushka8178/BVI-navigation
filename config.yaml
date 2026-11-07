@@ -133,6 +133,28 @@ memory:
   dynamic_labels: [person, dog, bicycle, car, bus, truck, motorbike, tricycle, autorickshaw, animal]
 
 # ------------------------------------------------------------------
+# Reasoning over memory (navigation/memory_reasoning.py)
+# Evidence-based forgetting: a remembered static hazard that should be in
+# clear view (trusted pose, forward distance forget_min_m..forget_max_m,
+# at least forget_edge_margin_deg inside the camera's field of view, not
+# hidden behind a detection within occlusion_deg that is occlusion_margin_m
+# nearer) but is not detected gets a miss (at most one per miss_interval_s):
+# belief *= miss_factor. Forgotten after forget_after_misses misses or
+# belief < forget_belief. Each sighting: misses = 0, belief += hit_gain.
+# ------------------------------------------------------------------
+memory_reasoning:
+  forget_min_m: 1.5
+  forget_max_m: 6.0
+  forget_edge_margin_deg: 8.0
+  occlusion_deg: 6.0
+  occlusion_margin_m: 0.5
+  miss_interval_s: 0.5
+  miss_factor: 0.7
+  forget_after_misses: 4
+  forget_belief: 0.2
+  hit_gain: 0.3
+
+# ------------------------------------------------------------------
 # Acoustic attention (navigation/reasoning.py)
 # ------------------------------------------------------------------
 attention:

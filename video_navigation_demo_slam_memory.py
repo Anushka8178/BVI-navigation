@@ -65,6 +65,13 @@ from navigation.config import (
 from navigation.hazard import HazardSeverityClassifier
 from navigation.hrtf_renderer import HRTFRenderer
 from navigation.memory import RouteMemory, SessionClock
+from navigation.memory_reasoning import (
+    CameraModel,
+    MemoryReasoningConfig,
+    NegativeEvidenceState,
+    pose_is_trusted,
+    update_negative_evidence,
+)
 from navigation.minimap import draw_minimap
 from navigation.path_overlay import draw_lanes, lanes_for_minimap
 from navigation.models import FramePacket, Pose
@@ -457,13 +464,21 @@ def main() -> None:
     # TTC keep the pipeline clock.
     memory_clock = SessionClock(live=live)
     session_id = uuid.uuid4().hex
+    try:
+        reasoning_cfg = MemoryReasoningConfig.from_config(config["memory_reasoning"])
+    except (TypeError, ValueError) as error:
+        raise SystemExit(f"Config error: {error}") from error
     # Class-aware decay + reinforcement across journeys (config memory:).
     memory = RouteMemory.from_config(
         memory_cfg,
         db_path=str(db_path),
         session_id=session_id,
         now_fn=memory_clock,
+        hit_gain=reasoning_cfg.hit_gain,
     )
+    negative_state = NegativeEvidenceState()
+    # Set on the first frame (needs the frame height).
+    camera_model: CameraModel | None = None
     attention = AcousticAttention(
         top_k=int(attention_cfg["top_k"]),
         weights=tuple(float(w) for w in attention_cfg["weights"]),
@@ -636,6 +651,12 @@ def main() -> None:
                     )
                 except RuntimeError as error:
                     raise SystemExit(str(error)) from error
+                camera_model = CameraModel(
+                    hfov_deg=float(perception.horizontal_fov_deg),
+                    camera_height_m=float(perception_cfg["camera_height_m"]),
+                    image_h=int(frame_height),
+                    ground_labels=frozenset(perception_cfg["ground_labels"]),
+                )
 
             if first_timestamp is None:
                 first_timestamp = source_timestamp
@@ -766,6 +787,38 @@ def main() -> None:
                 current_frame_hazards.append(entry)
 
             # -------------------------------------------------
+            # Evidence-based forgetting (negative evidence)
+            # -------------------------------------------------
+            # A remembered static hazard that should be in clear view but
+            # is not detected loses belief; after a few misses it is
+            # forgotten (navigation/memory_reasoning.py). Needs a trusted
+            # pose (SLAM: TRACKING).
+            pose_trusted = pose_is_trusted(
+                pose, slam.state if slam is not None else None
+            )
+            seen_hazard_ids = {
+                entry.hazard_id for entry in current_frame_hazards if entry.hazard_id
+            }
+            remembered = memory.get_hazards()
+            forget_events = update_negative_evidence(
+                memory,
+                remembered,
+                pose,
+                detections,
+                seen_hazard_ids,
+                memory_time,
+                reasoning_cfg,
+                camera_model,
+                negative_state,
+                pose_trusted=pose_trusted,
+            )
+            if forget_events:
+                forgotten_ids = {event.hazard_id for event in forget_events}
+                remembered = [
+                    h for h in remembered if h.hazard_id not in forgotten_ids
+                ]
+
+            # -------------------------------------------------
             # Path planning first
             # -------------------------------------------------
             # The hazard classifier now receives path-blocking and TTC
@@ -884,7 +937,7 @@ def main() -> None:
             # Persistent-memory attention
             # -------------------------------------------------
             top_hazards = attention.rank(
-                memory.get_hazards(),
+                list(remembered),
                 pose,
             )
 
@@ -940,8 +993,8 @@ def main() -> None:
                 ),
                 slam.loop_edges() if slam is not None else [],
                 [
-                    (h.world_x, h.world_y, h.label, h.decay_weight)
-                    for h in memory.get_hazards()[:40]
+                    (h.world_x, h.world_y, h.label, h.decay_weight * h.belief)
+                    for h in remembered[:40]
                 ],
                 (pose.x, pose.y, pose.heading_deg),
                 slam_state,
@@ -1138,6 +1191,20 @@ def main() -> None:
         ),
         "path_events": path_events,
         "warning_events": warning_events,
+        "negative_evidence": {
+            "misses_recorded": negative_state.misses_recorded,
+            "hazards_forgotten": len(negative_state.forgotten),
+            "forgotten": [
+                {
+                    "hazard_id": event.hazard_id,
+                    "label": event.label,
+                    "misses": event.misses,
+                    "belief": round(event.belief, 3),
+                    "time_s": round(event.time - memory_clock.run_start_epoch, 3),
+                }
+                for event in negative_state.forgotten
+            ],
+        },
         "persistent_memory": [
             {
                 "hazard_id": hazard.hazard_id,

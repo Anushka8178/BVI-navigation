@@ -95,3 +95,47 @@ Tests added
 - `tests/test_config.py`: the memory section builds a `RouteMemory`.
 
 Result: `python -m pytest -q` gives **163 passed**.
+
+## Task 3: evidence-based forgetting (negative evidence)
+
+(Done before Task 4: Task 4 builds on the same module.)
+
+What changed
+- New `navigation/memory_reasoning.py` (pure logic, used by the demo and the eval tool):
+  `MemoryReasoningConfig.from_config()` (rejects unknown keys), `CameraModel` (hfov, camera
+  height, image height, ground labels; nearest visible ground from
+  `path_overlay.nearest_visible_m`), `pose_is_trusted(pose, slam_state)`, `expected_visible`,
+  `is_occluded`, `is_seen` and `update_negative_evidence(...)` returning `ForgetEvent`s.
+- `RouteMemory.record_miss(hazard_id, factor)` (misses += 1, belief *= factor),
+  `RouteMemory.forget(hazard_id)`. `remember()` (a real sighting) sets `misses = 0` and
+  `belief = min(1, belief + hit_gain)`, with `hit_gain` passed from config.
+- `config.yaml` `memory_reasoning:` holds all the numbers from the task. It is a required
+  config section now.
+- Demo: after the frame's detections are remembered, runs `update_negative_evidence` with
+  the trusted-pose rule (SLAM must be TRACKING) and the hazard_ids this frame matched. Logs
+  `MEMORY | forgot <label> <id>: not seen in clear view N times`. The one `get_hazards()` read
+  per frame is shared by attention and the mini-map (it used to be read twice). The mini-map
+  shade uses decay x belief. The JSON report has a `negative_evidence` block.
+
+Decisions
+- "Matched by a current detection" = the detection was resolved to this hazard_id by
+  `RouteMemory.remember()`, **or** a same-label detection lies within `memory.match_radius_m`
+  (the same gate memory uses). The second part keeps a noisy duplicate from counting as a miss.
+- The occlusion test compares the detection's distance with the hazard's range (not only
+  its forward distance). The 0.5 m margin is `occlusion_margin_m` in config.
+- The miss interval is checked as `now - last_miss >= miss_interval_s`.
+- With `--pose sim` the pose is invented, so negative evidence (like memory itself) is
+  only meaningful with `--pose slam` or `--pose phone`. The code does not special-case it.
+
+Tests added (`tests/test_memory_reasoning.py`, 14): forgotten after 4 misses spaced
+0.6 s (misses closer than 0.5 s don't count; log line checked); an occluded hazard gets no
+miss but a detection 10 deg away doesn't hide it; FOV edge, too far, too close and
+ground-level below the image bottom get no miss; a dynamic hazard is never touched; an
+invalid pose or SLAM not TRACKING touches nothing; a matched detection is not a miss, a
+different label is; a sighting resets misses and adds hit_gain; heading is used; config
+section = dataclass.
+
+Smoke run: `video_navigation_demo_slam_memory.py --source videos\street1.mp4 --no-audio
+--no-esp32 --no-display` (temp db) processed 141 frames at 15 FPS on CPU with no errors.
+
+Result: `python -m pytest -q` gives **177 passed**.

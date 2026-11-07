@@ -13,6 +13,8 @@ DEFAULT_HALF_LIFE_S = 30.0
 DEFAULT_MIN_DECAY_WEIGHT = 0.05
 DEFAULT_MAX_ENTRIES = 500
 DEFAULT_MATCH_RADIUS_M = 1.0
+# Belief regained per sighting (config: memory_reasoning.hit_gain).
+DEFAULT_HIT_GAIN = 0.3
 # Labels that can move on their own: matched against the position
 # predicted from their stored velocity, not their last-seen position.
 DEFAULT_DYNAMIC_LABELS = frozenset(
@@ -150,6 +152,10 @@ class RouteMemory:
     1 to `times_seen`; the first sighting in a new session also adds 1 to
     `sessions_seen`.
 
+    Existence belief: `record_miss()` (negative evidence, see
+    navigation/memory_reasoning.py) lowers `belief`; every sighting resets
+    `misses` to 0 and adds `hit_gain` to `belief` (capped at 1).
+
     Identity: each stored hazard has a uuid4 `hazard_id`. A new detection
     is resolved to a hazard in this order:
 
@@ -216,8 +222,10 @@ class RouteMemory:
         default_half_life_s: float | None = None,
         reinforce_per_session: float = 0.0,
         reinforce_max: float = 1.0,
+        hit_gain: float = DEFAULT_HIT_GAIN,
     ) -> None:
         self.db_path = db_path
+        self.hit_gain = float(hit_gain)
         self.decay_half_life_s = decay_half_life_s
         self.min_decay_weight = min_decay_weight
         self.max_entries = max_entries
@@ -519,7 +527,9 @@ class RouteMemory:
                     sessions_seen = hazards.sessions_seen + CASE
                         WHEN hazards.last_session IS excluded.last_session THEN 0
                         ELSE 1 END,
-                    last_session = excluded.last_session
+                    last_session = excluded.last_session,
+                    misses = 0,
+                    belief = MIN(1.0, hazards.belief + ?)
                 """,
                 (
                     hazard_id,
@@ -537,6 +547,7 @@ class RouteMemory:
                     None if anchor is None else float(anchor[2]),
                     timestamp,
                     self.session_id,
+                    self.hit_gain,
                 ),
             )
             row = connection.execute(
@@ -643,6 +654,33 @@ class RouteMemory:
             ).fetchall()
 
         return [self._entry(row) for row in rows]
+
+    def record_miss(self, hazard_id: str, miss_factor: float) -> HazardEntry | None:
+        """Negative evidence: the hazard was expected in clear view but not
+        detected. misses += 1, belief *= miss_factor. Returns the updated
+        entry, or None if the hazard is no longer in memory."""
+        with contextlib.closing(self._connect()) as connection, connection:
+            connection.execute(
+                "UPDATE hazards SET misses = misses + 1, belief = belief * ? "
+                "WHERE hazard_id = ?",
+                (float(miss_factor), hazard_id),
+            )
+            row = connection.execute(
+                f"SELECT {self._SELECT_COLUMNS} FROM hazards WHERE hazard_id = ?",
+                (hazard_id,),
+            ).fetchone()
+        return None if row is None else self._entry(row)
+
+    def forget(self, hazard_id: str) -> bool:
+        """Delete one hazard (e.g. removed obstacle). True if it existed."""
+        with contextlib.closing(self._connect()) as connection, connection:
+            deleted = connection.execute(
+                "DELETE FROM hazards WHERE hazard_id = ?", (hazard_id,)
+            ).rowcount
+        for track, hid in list(self._track_to_hazard.items()):
+            if hid == hazard_id:
+                del self._track_to_hazard[track]
+        return deleted > 0
 
     def reanchor(self, anchor_poses: dict[str, tuple[float, float, float]]) -> int:
         """Move anchored hazards with their SLAM keyframes.

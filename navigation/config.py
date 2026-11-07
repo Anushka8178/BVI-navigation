@@ -28,6 +28,7 @@ REQUIRED_SECTIONS = (
     "planner",
     "trajectory",
     "memory",
+    "memory_reasoning",
     "attention",
     "audio",
 )
