@@ -1342,8 +1342,10 @@ def main() -> None:
                 "Distance is monocular (object height, or box bottom edge for ground-level "
                 "classes), not measured depth"
                 + (
-                    "; the ESP32 ultrasonic sensor corrects the detection straight ahead "
-                    "when it has a fresh reading."
+                    "; the ESP32 ultrasonic sensor corrected the detection straight ahead "
+                    f"when it had a fresh reading ({range_frames} frames with a reading)."
+                    if range_sensor is not None and range_frames > 0
+                    else "; the ESP32 ultrasonic sensor gave no readings in this run."
                     if range_sensor is not None
                     else "; the ESP32 ultrasonic sensor was not used (--no-esp32)."
                 )
