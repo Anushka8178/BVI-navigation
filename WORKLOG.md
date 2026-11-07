@@ -208,3 +208,63 @@ were filled. Memory doubled (10 to 20 rows) because `--pose sim` does not follow
 so a pole's world position drifts as the camera approaches. This is known bug #1 (use slam/phone).
 
 Result: `python -m pytest -q` gives **202 passed**.
+
+## Task 6: memory evaluation tool (`tools/eval_memory.py`)
+
+(Done before Task 5, following the priority order; Task 7 docs last so they cover everything.)
+
+What it does
+- Hardware-free, deterministic per seed. Uses the real `RouteMemory` (temp SQLite DB per
+  variant, fake clock), `AcousticAttention`, `memory_reasoning` (`update_negative_evidence`,
+  `MemoryEarlyWarning`), `LocalPathPlanner`, `HazardSeverityClassifier` and
+  `HazardTrajectoryTracker`, all built from `config.yaml`. Only the camera, the pose error and
+  the audio timing are simulated. `SimAudio` mirrors `HRTFRenderer`: per-kind cooldown counted
+  from the end of the sound.
+- World: a 20 m square campus loop (80 m, clockwise, 1 m/s, 10 Hz, 60 deg/s turns in place) =
+  `synthetic_scene.square_walk(20)` shifted to start at (0,0) facing +y. 10 static hazards
+  (2 potholes, stairs, curb, 2 poles, 2 cones, 2 barriers) placed by fraction along each leg.
+  Passing pedestrians come toward the user at 1.2 m/s, about 4 per minute, and occlude what is behind them.
+- Sessions: S1 day 0; S2 day 2 (cone-1 removed, barrier-2 added); S3 day 9 (pothole-2 repaired).
+- Variants: A no memory; B one 30 s half-life, no cues (system before this work, with the fixed
+  epoch clock so only the decay policy differs); C class-aware decay + reinforcement + cues;
+  D = C + negative evidence.
+- Metrics per variant x session (pooled over `--runs` seeds, default 5): static hazards remembered
+  at the walk's start; % warned before the first camera detection (and lead s / true distance m);
+  % warned before the first camera *alert* (urgent/path cue) and that lead; stale cues; false
+  cues; false hazards in memory at the end; removed objects still remembered; memory cues/min and
+  urgent+path+memory cues/min; memory size; position error of remembered hazards; cue direction
+  error; rows forgotten by negative evidence, how many belonged to objects still present, and
+  objects lost from memory.
+- Output: `runs/memory_eval/results.csv`, `results.md`, `results.png` (matplotlib; OpenCV fallback)
+  and the table on the console. `--pose-model phone`, `--render-slam` (real `VisualSLAM` on
+  `synthetic_scene` frames, room 4 m larger than the loop on each side, new map per session),
+  `--runs`, `--seed`, `--side`, `--fps`, `--p-detect`, `--max-range`, `--out`.
+
+Parameters (chosen once, before seeing results)
+- Detector: the task's values: FOV 70 deg, range 1-8 m (ground classes from the nearest visible
+  ground, 2.47 m at 1.3 m camera height), p_detect 0.85, distance noise 10 %, bearing noise 2 deg.
+  False positives 0.01/frame (about one every 10 s), as transient single-frame boxes of a random static class
+  at 2.5-8 m inside the view. People occlude objects behind them (0.3 m radius). That is physical,
+  and it is the same situation the negative-evidence occlusion guard handles.
+- SLAM pose model: error around the truth with sigma 0.15 m and 1 deg, correlated over 5 s (a
+  Gauss-Markov process), a new random offset each walk (relocalization error). Phone model: dead reckoning from the start
+  mark, stride error +-7 % and heading drift +-0.3 deg/s (random signs per walk) plus 1 deg noise.
+  These are the same magnitudes as `tools/simulate_slam_walk.py`.
+- The simulated walker follows the route and does not react to cues (exposure model).
+- Walking 1 m/s, 10 Hz, 4 people/min: plausible campus values; not varied afterwards.
+
+Bugs and design gaps found by the evaluation (fixed in the code, not in the results)
+- **Unconfirmed one-frame detections were cued.** The first run (seed 7, before the fix) gave
+  C/D 8 false memory cues in S1 and 11-16 per walk later (memory cues 7-14/min). Each transient false
+  positive became "a remembered pole 6 m ahead" and was cued 1 s later. Fix:
+  `memory_reasoning.cue_min_sightings: 3`, the same confirmation idea as `planner.confirm_frames: 3`.
+  It applies to C and D alike. After it: 0 false cues.
+- Truth mapping in the tool: a memory row's object is the most frequent object that updated it.
+  With latest-wins, one false positive landing near a real pole would mark that row "false".
+- The false-positive count of seed 7 looked high (17 in S2). I checked it over 30 seeds: mean 9.2 vs 8.6
+  expected, so no bias. Because single seeds are noisy, the tool pools 5 seeded runs by default.
+
+Tests (`tests/test_eval_memory.py`): a tiny scenario (8 m loop, 5 Hz, 2 walks) runs in < 10 s and
+variant A never cues (B never cues; only D forgets); same seed gives the same result; B remembers
+nothing 2 days later while C still remembers the permanent hazards; route/world geometry;
+pooling over runs. `tests/test_memory_cues.py`: an unconfirmed one-frame hazard is not cued.

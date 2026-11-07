@@ -16,8 +16,9 @@ Evidence-based forgetting (`update_negative_evidence`)
 Memory early warning (`select_memory_cues`, `MemoryEarlyWarning`)
     The sonified part of top-k acoustic attention. Remembered static
     hazards that the camera does NOT see right now but that lie ahead
-    (cue_min_m..cue_max_m forward, within cue_max_bearing_deg) and are
-    still trusted (decay_weight x belief >= cue_min_trust) are ranked with
+    (cue_min_m..cue_max_m forward, within cue_max_bearing_deg), were
+    confirmed (seen in >= cue_min_sightings frames) and are still trusted
+    (decay_weight x belief >= cue_min_trust) are ranked with
     AcousticAttention; the best one not on cooldown gets a soft "remembered
     hazard" HRTF cue. At most one per frame, per-hazard and global
     cooldowns, and an urgent or path-guidance cue in the same frame
@@ -72,6 +73,7 @@ class MemoryReasoningConfig:
     cue_max_m: float = 8.0
     cue_max_bearing_deg: float = 40.0   # |bearing from heading|
     cue_min_trust: float = 0.3          # decay_weight x belief
+    cue_min_sightings: int = 3          # confirmed hazards only (as planner.confirm_frames)
     cue_cooldown_s: float = 8.0         # per hazard
     cue_global_cooldown_s: float = 2.0  # any memory cue
     cue_skip_seen_within_s: float = 1.0  # seen this recently = still in view
@@ -357,6 +359,8 @@ def select_memory_cues(
             continue
         if hazard.decay_weight * hazard.belief < cfg.cue_min_trust:
             continue
+        if hazard.times_seen < cfg.cue_min_sightings:
+            continue  # one-frame detection (often a false positive): not confirmed
         candidates.append(dataclasses.replace(hazard))  # rank() writes .priority
 
     for hazard in attention.rank(candidates, pose):

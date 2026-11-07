@@ -48,14 +48,19 @@ class Walks:
     """Walk 1 (two days ago) builds memory; walk 2 (now) gets the cues."""
 
     def __init__(self, tmp_path, hazards=(("pothole", 5.0, 0.0),)):
-        self.clock = Clock(T0 - 2 * DAY)
+        self.clock = Clock(T0 - 2 * DAY - 0.2)
         cfg = load_config()["memory"]
         db = str(tmp_path / "m.db")
         walk1 = RouteMemory.from_config(cfg, db_path=db, now_fn=self.clock, session_id="walk-1")
         self.ids = []
         for n, (label, distance, azimuth) in enumerate(hazards):
             x, y = at_polar(distance, azimuth)
-            self.ids.append(walk1.remember(f"{label}-{n}", label, x, y, 0.9, timestamp=self.clock.t).hazard_id)
+            # Three sightings (cue_min_sightings), the last one exactly 2 days ago.
+            for k in range(3):
+                entry = walk1.remember(
+                    f"{label}-{n}", label, x, y, 0.9, timestamp=self.clock.t + 0.1 * k
+                )
+            self.ids.append(entry.hazard_id)
         self.clock.t = T0
         self.memory = RouteMemory.from_config(cfg, db_path=db, now_fn=self.clock, session_id="walk-2")
         self.renderer = FakeRenderer()
@@ -153,6 +158,25 @@ def test_hazard_seen_a_moment_ago_is_still_in_view_not_a_memory(tmp_path):
     assert cue.earlier_walks == 1  # walk 1; this walk is not "earlier"
 
 
+def test_unconfirmed_one_frame_hazard_gets_no_cue(tmp_path):
+    # A single detection (typically a detector false positive) is remembered
+    # but is not trusted enough for an early warning until seen 3 times.
+    clock = Clock(T0)
+    memory = RouteMemory.from_config(
+        load_config()["memory"], db_path=str(tmp_path / "m.db"), now_fn=clock
+    )
+    memory.remember("pole-1001", "pole", 0.0, 5.0, 0.4, timestamp=T0)
+    warning = MemoryEarlyWarning(CFG, AcousticAttention(), log=None)
+    clock.t = T0 + 2.0
+    assert warning.update(memory.get_hazards(), POSE, [], set(), clock.t) is None
+
+    for k in (1, 2):
+        memory.remember("pole-1001", "pole", 0.0, 5.0, 0.4, timestamp=T0 + 2.0 + 0.1 * k)
+    clock.t = T0 + 4.0
+    assert memory.get_hazards()[0].times_seen == CFG.cue_min_sightings
+    assert warning.update(memory.get_hazards(), POSE, [], set(), clock.t) is not None
+
+
 def test_dynamic_hazard_gets_no_cue(tmp_path):
     clock = Clock(T0)
     memory = RouteMemory.from_config(
@@ -170,9 +194,10 @@ def test_hazard_seen_only_earlier_in_this_walk(tmp_path):
     memory = RouteMemory.from_config(
         load_config()["memory"], db_path=str(tmp_path / "m.db"), now_fn=clock, session_id="walk-1"
     )
-    memory.remember("curb-1", "curb", 0.0, 6.0, 0.9, timestamp=T0)
+    for k in range(3):
+        memory.remember("curb-1", "curb", 0.0, 6.0, 0.9, timestamp=T0 + 0.1 * k)
     warning = MemoryEarlyWarning(CFG, AcousticAttention(), session_id="walk-1", log=None)
-    clock.t = T0 + 40.0
+    clock.t = T0 + 40.2
     cue = warning.update(memory.get_hazards(), POSE, [], set(), clock.t)
     assert cue.earlier_walks == 0
     assert cue.describe() == "curb ahead 6.0 m | seen earlier in this walk, 40 s ago"

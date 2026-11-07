@@ -162,6 +162,7 @@ memory_reasoning:
   cue_max_m: 8.0
   cue_max_bearing_deg: 40.0
   cue_min_trust: 0.3
+  cue_min_sightings: 3         # confirmed hazards only (one-frame false positives are not cued)
   cue_cooldown_s: 8.0
   cue_global_cooldown_s: 2.0
   cue_skip_seen_within_s: 1.0  # seen this recently = still in view (a dropout, not a memory)
