@@ -3,7 +3,17 @@ import sqlite3
 import tempfile
 import unittest
 
-from navigation.memory import RouteMemory
+from navigation.memory import EPOCH_MIN_S, RouteMemory, SessionClock
+
+
+class FakeClock:
+    """Settable memory clock (epoch seconds in production; any value here)."""
+
+    def __init__(self, t: float = 0.0) -> None:
+        self.t = t
+
+    def __call__(self) -> float:
+        return self.t
 
 
 class TestRouteMemoryDecay(unittest.TestCase):
@@ -17,7 +27,7 @@ class TestRouteMemoryDecay(unittest.TestCase):
             os.remove(self.db_path)
 
     def test_fresh_hazard_has_full_decay_weight(self) -> None:
-        memory = RouteMemory(self.db_path, decay_half_life_s=10.0)
+        memory = RouteMemory(self.db_path, decay_half_life_s=10.0, now_fn=FakeClock(0.0))
 
         memory.remember("pole-1", "pole", 1.0, 0.0, 0.9, timestamp=0.0)
         hazards = memory.get_hazards()
@@ -26,11 +36,15 @@ class TestRouteMemoryDecay(unittest.TestCase):
         self.assertAlmostEqual(hazards[0].decay_weight, 1.0)
 
     def test_decay_weight_halves_after_one_half_life(self) -> None:
-        memory = RouteMemory(self.db_path, decay_half_life_s=10.0, min_decay_weight=0.0)
+        clock = FakeClock(0.0)
+        memory = RouteMemory(
+            self.db_path, decay_half_life_s=10.0, min_decay_weight=0.0, now_fn=clock
+        )
 
         memory.remember("pole-1", "pole", 1.0, 0.0, 0.9, timestamp=0.0)
-        # A second, unrelated hazard advances memory's notion of "now"
-        # to t=10s (one half-life later) without touching pole-1.
+        # One half-life later a second, unrelated hazard is seen; pole-1
+        # is not touched.
+        clock.t = 10.0
         memory.remember("curb-2", "curb", 2.0, 0.0, 0.9, timestamp=10.0)
 
         hazards = {h.object_id: h for h in memory.get_hazards()}
@@ -39,7 +53,9 @@ class TestRouteMemoryDecay(unittest.TestCase):
         self.assertAlmostEqual(hazards["curb-2"].decay_weight, 1.0, places=3)
 
     def test_reobserving_a_hazard_refreshes_its_decay_weight(self) -> None:
-        memory = RouteMemory(self.db_path, decay_half_life_s=10.0, min_decay_weight=0.0)
+        memory = RouteMemory(
+            self.db_path, decay_half_life_s=10.0, min_decay_weight=0.0, now_fn=FakeClock(20.0)
+        )
 
         memory.remember("pole-1", "pole", 1.0, 0.0, 0.9, timestamp=0.0)
         memory.remember("pole-1", "pole", 1.0, 0.0, 0.9, timestamp=20.0)
@@ -51,7 +67,9 @@ class TestRouteMemoryDecay(unittest.TestCase):
         self.assertAlmostEqual(hazards[0].timestamp, 20.0)
 
     def test_stale_hazard_is_forgotten_below_min_decay_weight(self) -> None:
-        memory = RouteMemory(self.db_path, decay_half_life_s=10.0, min_decay_weight=0.05)
+        memory = RouteMemory(
+            self.db_path, decay_half_life_s=10.0, min_decay_weight=0.05, now_fn=FakeClock(50.0)
+        )
 
         memory.remember("pole-1", "pole", 1.0, 0.0, 0.9, timestamp=0.0)
         # ~5 half-lives later: 0.5**5 = 0.03125, below the 0.05 floor.
@@ -68,6 +86,7 @@ class TestRouteMemoryDecay(unittest.TestCase):
             decay_half_life_s=1_000_000.0,  # effectively no time-decay for this test
             min_decay_weight=0.0,
             max_entries=3,
+            now_fn=FakeClock(0.0),
         )
 
         # Same timestamp for all -> decay_weight ties at 1.0, so confidence
@@ -85,7 +104,9 @@ class TestRouteMemoryDecay(unittest.TestCase):
         self.assertEqual(ids, {"b", "c", "d"})
 
     def test_decay_and_prune_returns_removed_count(self) -> None:
-        memory = RouteMemory(self.db_path, decay_half_life_s=10.0, min_decay_weight=0.05)
+        memory = RouteMemory(
+            self.db_path, decay_half_life_s=10.0, min_decay_weight=0.05, now_fn=FakeClock(0.0)
+        )
 
         memory.remember("pole-1", "pole", 1.0, 0.0, 0.9, timestamp=0.0)
 
@@ -95,7 +116,9 @@ class TestRouteMemoryDecay(unittest.TestCase):
         self.assertEqual(memory.get_hazards(), [])
 
     def test_velocity_is_persisted_alongside_decay(self) -> None:
-        memory = RouteMemory(self.db_path, decay_half_life_s=10.0, min_decay_weight=0.0)
+        memory = RouteMemory(
+            self.db_path, decay_half_life_s=10.0, min_decay_weight=0.0, now_fn=FakeClock(10.0)
+        )
 
         entry = memory.remember(
             "person-1", "person", 1.0, 2.0, 0.8, timestamp=0.0,
@@ -170,6 +193,151 @@ class TestRouteMemoryDecay(unittest.TestCase):
         # Reopening an already-migrated DB keeps the same ids.
         reopened = {h.object_id: h.hazard_id for h in RouteMemory(self.db_path).get_hazards()}
         self.assertEqual(reopened["pole-1"], hazards["pole-1"].hazard_id)
+
+
+class TestMemoryClockAndJourneys(unittest.TestCase):
+    def setUp(self) -> None:
+        handle, self.db_path = tempfile.mkstemp(suffix=".db")
+        os.close(handle)
+        os.remove(self.db_path)
+
+    def tearDown(self) -> None:
+        if os.path.exists(self.db_path):
+            os.remove(self.db_path)
+
+    def test_decay_uses_injected_clock_not_newest_timestamp(self) -> None:
+        clock = FakeClock(1_000.0)
+        memory = RouteMemory(
+            self.db_path, decay_half_life_s=10.0, min_decay_weight=0.0, now_fn=clock
+        )
+
+        entry = memory.remember("pole-1", "pole", 1.0, 0.0, 0.9)  # stamped by the clock
+        self.assertEqual(entry.timestamp, 1_000.0)
+
+        # Nothing new is seen, but time passes: memory still ages.
+        clock.t = 1_010.0
+        self.assertAlmostEqual(memory.get_hazards()[0].decay_weight, 0.5)
+        clock.t = 1_020.0
+        memory.decay_and_prune()
+        self.assertAlmostEqual(memory.get_hazards()[0].decay_weight, 0.25)
+
+    def test_sightings_and_sessions_are_counted(self) -> None:
+        clock = FakeClock(100.0)
+        walk1 = RouteMemory(self.db_path, session_id="walk-1", now_fn=clock)
+        first = walk1.remember("pothole-1", "pothole", 0.0, 5.0, 0.8, timestamp=100.0)
+        again = walk1.remember("pothole-1", "pothole", 0.1, 5.0, 0.8, timestamp=101.0)
+
+        self.assertEqual((first.times_seen, first.sessions_seen), (1, 1))
+        self.assertEqual((again.times_seen, again.sessions_seen), (2, 1))
+        self.assertEqual(again.first_seen, 100.0)
+
+        clock.t = 200.0
+        walk2 = RouteMemory(self.db_path, session_id="walk-2", now_fn=clock)
+        seen = walk2.remember("pothole-7", "pothole", 0.2, 5.1, 0.8, timestamp=200.0)
+        walk2.remember("pothole-7", "pothole", 0.2, 5.1, 0.8, timestamp=200.5)
+
+        self.assertEqual(seen.hazard_id, first.hazard_id)
+        stored = walk2.get_hazards()[0]
+        self.assertEqual(stored.sessions_seen, 2)
+        self.assertEqual(stored.times_seen, 4)
+        self.assertEqual(stored.last_session, "walk-2")
+        self.assertEqual(stored.first_seen, 100.0)
+        self.assertEqual((stored.belief, stored.misses), (1.0, 0))
+
+    def test_sessions_get_distinct_default_ids(self) -> None:
+        a = RouteMemory(self.db_path)
+        b = RouteMemory(self.db_path)
+        self.assertNotEqual(a.session_id, b.session_id)
+
+    def test_table_without_journey_columns_is_migrated(self) -> None:
+        # Schema of the slam-vo branch: hazard_id + anchor, no journey columns.
+        connection = sqlite3.connect(self.db_path)
+        connection.execute(
+            """
+            CREATE TABLE hazards (
+                hazard_id TEXT PRIMARY KEY, object_id TEXT NOT NULL,
+                label TEXT NOT NULL, world_x REAL NOT NULL, world_y REAL NOT NULL,
+                confidence REAL NOT NULL, timestamp REAL NOT NULL,
+                decay_weight REAL NOT NULL DEFAULT 1.0,
+                velocity_x REAL NOT NULL DEFAULT 0.0,
+                velocity_y REAL NOT NULL DEFAULT 0.0,
+                anchor TEXT, anchor_right REAL, anchor_forward REAL
+            )
+            """
+        )
+        connection.executemany(
+            "INSERT INTO hazards VALUES (?, ?, ?, ?, ?, ?, ?, 1.0, 0.0, 0.0, NULL, NULL, NULL)",
+            [
+                ("h-video", "pole-1", "pole", 1.0, 2.0, 0.9, 12.5),  # old video clock
+                ("h-epoch", "curb-2", "curb", 3.0, 4.0, 0.8, 1_700_000_000.0),
+            ],
+        )
+        connection.commit()
+        connection.close()
+
+        clock = FakeClock(1_700_000_100.0)
+        memory = RouteMemory(self.db_path, decay_half_life_s=1e9, now_fn=clock)
+        hazards = {h.hazard_id: h for h in memory.get_hazards()}
+
+        self.assertEqual(set(hazards), {"h-video", "h-epoch"})
+        # Video-clock row: real age unknown, re-stamped as seen at migration.
+        self.assertEqual(hazards["h-video"].timestamp, clock.t)
+        self.assertEqual(hazards["h-video"].first_seen, clock.t)
+        self.assertEqual(hazards["h-epoch"].timestamp, 1_700_000_000.0)
+        self.assertEqual(hazards["h-epoch"].first_seen, 1_700_000_000.0)
+        for hazard in hazards.values():
+            self.assertEqual((hazard.times_seen, hazard.sessions_seen), (1, 1))
+            self.assertEqual((hazard.belief, hazard.misses), (1.0, 0))
+
+        # A sighting in this new session counts as a second session.
+        seen = memory.remember("curb-9", "curb", 3.1, 4.0, 0.8, timestamp=clock.t)
+        self.assertEqual(seen.hazard_id, "h-epoch")
+        self.assertEqual(seen.sessions_seen, 2)
+
+        # Reopening does not re-stamp anything.
+        clock.t += 50.0
+        reopened = {h.hazard_id: h for h in RouteMemory(self.db_path, now_fn=clock).get_hazards()}
+        self.assertEqual(reopened["h-video"].timestamp, 1_700_000_100.0)
+
+
+class TestSessionClock(unittest.TestCase):
+    def test_recorded_video_gives_increasing_epoch_timestamps(self) -> None:
+        clock = SessionClock(live=False, run_start_epoch=1_750_000_000.0)
+        stamps = [clock.stamp(t) for t in (0.0, 0.04, 0.08, 5.0)]
+
+        self.assertEqual(stamps[0], 1_750_000_000.0)
+        self.assertTrue(all(b > a for a, b in zip(stamps, stamps[1:])))
+        self.assertTrue(all(s >= EPOCH_MIN_S for s in stamps))
+        self.assertEqual(clock(), stamps[-1])  # now = latest frame
+
+        # The next run of the same video starts later, so it is "later".
+        rerun = SessionClock(live=False, run_start_epoch=1_750_000_600.0)
+        self.assertGreater(rerun.stamp(0.0), stamps[-1])
+
+    def test_default_start_is_wall_clock_and_live_uses_wall_clock(self) -> None:
+        wall = FakeClock(1_760_000_000.0)
+        recorded = SessionClock(live=False, wall=wall)
+        self.assertEqual(recorded.stamp(2.0), 1_760_000_002.0)
+
+        live = SessionClock(live=True, wall=wall)
+        wall.t = 1_760_000_123.0
+        self.assertEqual(live.stamp(999.0), 1_760_000_123.0)  # video time ignored
+
+    def test_memory_written_with_recorded_clock_survives_and_orders(self) -> None:
+        handle, db_path = tempfile.mkstemp(suffix=".db")
+        os.close(handle)
+        os.remove(db_path)
+        try:
+            clock = SessionClock(live=False, run_start_epoch=1_750_000_000.0)
+            memory = RouteMemory(db_path, decay_half_life_s=30.0, now_fn=clock)
+            memory.remember("pole-1", "pole", 0.0, 3.0, 0.9, timestamp=clock.stamp(0.0))
+            memory.remember("cone-1", "reflective_cone", 2.0, 3.0, 0.9, timestamp=clock.stamp(1.0))
+            hazards = memory.get_hazards()
+            self.assertEqual([h.label for h in hazards], ["reflective_cone", "pole"])
+            self.assertAlmostEqual(hazards[1].decay_weight, 0.5 ** (1 / 30))
+        finally:
+            if os.path.exists(db_path):
+                os.remove(db_path)
 
 
 class TestRouteMemoryMatching(unittest.TestCase):

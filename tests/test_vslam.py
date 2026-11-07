@@ -247,7 +247,7 @@ def test_square_loop_closure_removes_drift(room, K):
 
 
 def test_anchored_hazard_moves_with_its_keyframe(tmp_path):
-    memory = RouteMemory(str(tmp_path / "m.db"))
+    memory = RouteMemory(str(tmp_path / "m.db"), now_fn=lambda: 10.0)
     kf_pose = (1.0, 2.0, 90.0)
     right, forward = relative(kf_pose, (3.0, 2.0, 0.0))[:2]  # 2 m ahead of the keyframe
     memory.remember("pole-1", "pole", 3.0, 2.0, 0.9, timestamp=10.0, anchor=("m:5", right, forward))

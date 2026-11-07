@@ -46,6 +46,7 @@ from __future__ import annotations
 import argparse
 import json
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -63,7 +64,7 @@ from navigation.config import (
 )
 from navigation.hazard import HazardSeverityClassifier
 from navigation.hrtf_renderer import HRTFRenderer
-from navigation.memory import RouteMemory
+from navigation.memory import RouteMemory, SessionClock
 from navigation.minimap import draw_minimap
 from navigation.path_overlay import draw_lanes, lanes_for_minimap
 from navigation.models import FramePacket, Pose
@@ -451,6 +452,11 @@ def main() -> None:
 
     severity = HazardSeverityClassifier(**config["hazard"])
 
+    # Memory ages in epoch seconds across runs: wall clock for live
+    # streams, run start + video time for recorded videos. Tracking and
+    # TTC keep the pipeline clock.
+    memory_clock = SessionClock(live=live)
+    session_id = uuid.uuid4().hex
     memory = RouteMemory(
         str(db_path),
         decay_half_life_s=float(memory_cfg["decay_half_life_s"]),
@@ -458,6 +464,8 @@ def main() -> None:
         max_entries=int(memory_cfg["max_entries"]),
         match_radius_m=float(memory_cfg["match_radius_m"]),
         dynamic_labels=frozenset(memory_cfg["dynamic_labels"]),
+        session_id=session_id,
+        now_fn=memory_clock,
     )
     attention = AcousticAttention(
         top_k=int(attention_cfg["top_k"]),
@@ -637,10 +645,12 @@ def main() -> None:
 
             frame_id += 1
             # Video time for files, wall-clock time for live streams.
-            # Tracking, TTC and memory decay all use this clock.
+            # Tracking and TTC use this clock.
             timestamp = source_timestamp
             # Seconds since the first frame (simulated pose and report).
             elapsed_s = source_timestamp - first_timestamp
+            # Persistent memory uses epoch seconds (see SessionClock).
+            memory_time = memory_clock.stamp(elapsed_s)
 
             frame_packet = FramePacket(
                 frame_id=frame_id,
@@ -738,7 +748,7 @@ def main() -> None:
                     world_x=localized.world_x,
                     world_y=localized.world_y,
                     confidence=localized.confidence,
-                    timestamp=localized.timestamp,
+                    timestamp=memory_time,
                     velocity_x=track.velocity_x,
                     velocity_y=track.velocity_y,
                     # Invalid pose: world position unknown, don't store it.
@@ -1080,6 +1090,12 @@ def main() -> None:
         "pose_source": pose_mode,
         "annotated_video": str(output_path.resolve()),
         "memory_db": str(db_path.resolve()),
+        "memory_session_id": session_id,
+        "memory_clock": (
+            "wall clock (live)"
+            if live
+            else f"run start epoch {memory_clock.run_start_epoch:.3f} + video time"
+        ),
         "config": config,
         "hrtf_file": (
             str(hrtf_path.resolve())
@@ -1134,6 +1150,14 @@ def main() -> None:
                 "world_y": round(hazard.world_y, 3),
                 "confidence": round(hazard.confidence, 3),
                 "last_seen_timestamp": round(hazard.timestamp, 3),
+                "first_seen_timestamp": (
+                    None if hazard.first_seen is None else round(hazard.first_seen, 3)
+                ),
+                "times_seen": hazard.times_seen,
+                "sessions_seen": hazard.sessions_seen,
+                "decay_weight": round(hazard.decay_weight, 4),
+                "belief": round(hazard.belief, 3),
+                "misses": hazard.misses,
                 "velocity_x": round(hazard.velocity_x, 3),
                 "velocity_y": round(hazard.velocity_y, 3),
             }

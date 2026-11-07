@@ -6,6 +6,7 @@ import sqlite3
 import time
 import uuid
 from dataclasses import dataclass
+from typing import Callable
 
 
 DEFAULT_HALF_LIFE_S = 30.0
@@ -18,6 +19,48 @@ DEFAULT_DYNAMIC_LABELS = frozenset(
     {"person", "dog", "bicycle", "car", "bus", "truck", "motorbike", "tricycle",
      "autorickshaw", "animal"}
 )
+# Timestamps below this (2001-09-09) are not epoch seconds: older databases
+# stored video time, which restarts at 0 every run.
+EPOCH_MIN_S = 1e9
+
+
+class SessionClock:
+    """Wall-clock epoch seconds for persistent memory.
+
+    Memory must age in real time across runs, whatever the source:
+
+    - live stream: `time.time()` at each frame;
+    - recorded video: the run's start epoch + video seconds since the
+      first frame, so a replayed video still moves forward in real time
+      and a later run is always "later" than an earlier one.
+
+    `stamp(elapsed_s)` returns the timestamp for a frame and makes it the
+    current time; calling the clock (`clock()`) returns that time, so it
+    can be passed straight to `RouteMemory(now_fn=clock)`. Tracking and
+    TTC keep using the pipeline clock; only memory uses this one.
+    """
+
+    def __init__(
+        self,
+        live: bool,
+        run_start_epoch: float | None = None,
+        wall: Callable[[], float] = time.time,
+    ) -> None:
+        self.live = live
+        self._wall = wall
+        self.run_start_epoch = wall() if run_start_epoch is None else float(run_start_epoch)
+        self._now = self.run_start_epoch
+
+    def stamp(self, elapsed_s: float) -> float:
+        """Memory timestamp of a frame `elapsed_s` after the first frame."""
+        if self.live:
+            self._now = self._wall()
+        else:
+            self._now = self.run_start_epoch + max(float(elapsed_s), 0.0)
+        return self._now
+
+    def __call__(self) -> float:
+        return self._now
 
 
 @dataclass
@@ -40,6 +83,14 @@ class HazardEntry:
     velocity_x: float = 0.0
     velocity_y: float = 0.0
     hazard_id: str = ""
+    # Journey bookkeeping (memory clock = epoch seconds, see SessionClock).
+    first_seen: float | None = None
+    times_seen: int = 1
+    sessions_seen: int = 1
+    last_session: str = ""
+    # Existence belief 0..1, lowered by negative evidence (missed in clear view).
+    belief: float = 1.0
+    misses: int = 0
 
 
 class RouteMemory:
@@ -63,11 +114,13 @@ class RouteMemory:
       lowest-ranked surviving rows (decay_weight * confidence) are
       evicted until the cap is respected.
 
-    "Now" for decay purposes is whatever clock the caller's timestamps
-    already use -- wall-clock seconds (`remember()`'s default) or a
-    video's relative playback seconds, as in the SLAM-memory demos. By
-    default each decay pass uses the newest timestamp already stored in
-    memory as "now", so both clocks work with no extra configuration.
+    Clock: timestamps are wall-clock epoch seconds (see SessionClock).
+    "Now" comes from `now_fn` (default `time.time`); tests and the
+    evaluation tool inject a fake clock to simulate days between walks.
+
+    Journeys: every run has a `session_id`. Each persisted sighting adds
+    1 to `times_seen`; the first sighting in a new session also adds 1 to
+    `sessions_seen`.
 
     Identity: each stored hazard has a uuid4 `hazard_id`. A new detection
     is resolved to a hazard in this order:
@@ -92,16 +145,34 @@ class RouteMemory:
             velocity_y REAL NOT NULL DEFAULT 0.0,
             anchor TEXT,
             anchor_right REAL,
-            anchor_forward REAL
+            anchor_forward REAL,
+            first_seen REAL,
+            times_seen INTEGER NOT NULL DEFAULT 1,
+            sessions_seen INTEGER NOT NULL DEFAULT 1,
+            last_session TEXT,
+            belief REAL NOT NULL DEFAULT 1.0,
+            misses INTEGER NOT NULL DEFAULT 0
         )
     """
 
     # Columns added after the hazard_id schema; ALTERed into older tables.
-    _ANCHOR_COLUMNS = (
+    _ADDED_COLUMNS = (
         ("anchor", "TEXT"),
         ("anchor_right", "REAL"),
         ("anchor_forward", "REAL"),
+        ("first_seen", "REAL"),
+        ("times_seen", "INTEGER NOT NULL DEFAULT 1"),
+        ("sessions_seen", "INTEGER NOT NULL DEFAULT 1"),
+        ("last_session", "TEXT"),
+        ("belief", "REAL NOT NULL DEFAULT 1.0"),
+        ("misses", "INTEGER NOT NULL DEFAULT 0"),
     )
+
+    _SELECT_COLUMNS = """
+        object_id, label, world_x, world_y, confidence, timestamp,
+        decay_weight, velocity_x, velocity_y, hazard_id, first_seen,
+        times_seen, sessions_seen, last_session, belief, misses
+    """
 
     def __init__(
         self,
@@ -111,6 +182,8 @@ class RouteMemory:
         max_entries: int = DEFAULT_MAX_ENTRIES,
         match_radius_m: float = DEFAULT_MATCH_RADIUS_M,
         dynamic_labels: frozenset[str] | set[str] = DEFAULT_DYNAMIC_LABELS,
+        session_id: str | None = None,
+        now_fn: Callable[[], float] = time.time,
     ) -> None:
         self.db_path = db_path
         self.decay_half_life_s = decay_half_life_s
@@ -118,6 +191,8 @@ class RouteMemory:
         self.max_entries = max_entries
         self.match_radius_m = match_radius_m
         self.dynamic_labels = frozenset(dynamic_labels)
+        self.session_id = session_id or uuid.uuid4().hex
+        self.now_fn = now_fn
         # Track id -> hazard_id, for this run only (YOLO ids restart per run).
         self._track_to_hazard: dict[str, str] = {}
         self._create_table()
@@ -143,9 +218,12 @@ class RouteMemory:
                 row[1]
                 for row in connection.execute("PRAGMA table_info(hazards)").fetchall()
             }
-            for name, kind in self._ANCHOR_COLUMNS:
+            for name, kind in self._ADDED_COLUMNS:
                 if name not in present:
                     connection.execute(f"ALTER TABLE hazards ADD COLUMN {name} {kind}")
+
+            if columns and "first_seen" not in columns:
+                self._upgrade_clock(connection)
 
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_hazards_label ON hazards(label)"
@@ -185,6 +263,21 @@ class RouteMemory:
             [(str(uuid.uuid4()), *row) for row in rows],
         )
         connection.execute("DROP TABLE hazards_legacy")
+
+    def _upgrade_clock(self, connection: sqlite3.Connection) -> None:
+        """Fill the journey columns of a table written before they existed.
+
+        Old rows may hold video time (restarts at 0 every run), so their
+        real age is unknown: rather than treating them as decades old (and
+        deleting them all), they are re-stamped as seen now.
+        """
+        connection.execute(
+            "UPDATE hazards SET timestamp = ? WHERE timestamp < ?",
+            (float(self.now_fn()), EPOCH_MIN_S),
+        )
+        connection.execute(
+            "UPDATE hazards SET first_seen = timestamp WHERE first_seen IS NULL"
+        )
 
     def _match_hazard(
         self,
@@ -261,6 +354,7 @@ class RouteMemory:
         is the one passed in, so callers can still link it to this frame's
         detection.
 
+        `timestamp` is memory-clock epoch seconds (default `now_fn()`).
         A freshly (re)observed hazard is written with a full decay_weight
         of 1.0. Every call also ages and prunes the rest of memory relative
         to this timestamp, so the table stays bounded.
@@ -272,7 +366,7 @@ class RouteMemory:
         """
 
         if timestamp is None:
-            timestamp = time.time()
+            timestamp = float(self.now_fn())
 
         decay_weight = 1.0
 
@@ -312,9 +406,13 @@ class RouteMemory:
                     velocity_y,
                     anchor,
                     anchor_right,
-                    anchor_forward
+                    anchor_forward,
+                    first_seen,
+                    times_seen,
+                    sessions_seen,
+                    last_session
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?)
                 ON CONFLICT(hazard_id) DO UPDATE SET
                     object_id = excluded.object_id,
                     label = excluded.label,
@@ -327,7 +425,12 @@ class RouteMemory:
                     velocity_y = excluded.velocity_y,
                     anchor = excluded.anchor,
                     anchor_right = excluded.anchor_right,
-                    anchor_forward = excluded.anchor_forward
+                    anchor_forward = excluded.anchor_forward,
+                    times_seen = hazards.times_seen + 1,
+                    sessions_seen = hazards.sessions_seen + CASE
+                        WHEN hazards.last_session IS excluded.last_session THEN 0
+                        ELSE 1 END,
+                    last_session = excluded.last_session
                 """,
                 (
                     hazard_id,
@@ -343,24 +446,21 @@ class RouteMemory:
                     None if anchor is None else anchor[0],
                     None if anchor is None else float(anchor[1]),
                     None if anchor is None else float(anchor[2]),
+                    timestamp,
+                    self.session_id,
                 ),
             )
+            row = connection.execute(
+                f"SELECT {self._SELECT_COLUMNS} FROM hazards WHERE hazard_id = ?",
+                (hazard_id,),
+            ).fetchone()
+            # Same transaction as the write: one commit per sighting.
+            self._decay_and_prune(connection, timestamp)
 
         self._track_to_hazard[object_id] = hazard_id
-        self.decay_and_prune(now=timestamp)
-
-        return HazardEntry(
-            object_id=object_id,
-            label=label,
-            world_x=world_x,
-            world_y=world_y,
-            confidence=confidence,
-            timestamp=timestamp,
-            decay_weight=decay_weight,
-            velocity_x=velocity_x,
-            velocity_y=velocity_y,
-            hazard_id=hazard_id,
-        )
+        entry = self._entry(row)
+        entry.decay_weight = decay_weight
+        return entry
 
     def decay_and_prune(self, now: float | None = None) -> int:
         """Age every hazard's decay_weight, forget faded-out hazards, and
@@ -370,93 +470,90 @@ class RouteMemory:
         implicitly from `get_hazards()` -- since with no new detections
         it is a cheap no-op beyond the decay_weight refresh.
 
+        `now` defaults to `now_fn()` (epoch seconds).
+
         Returns the number of rows removed (decayed-out + pruned).
         """
+        if now is None:
+            now = float(self.now_fn())
         with contextlib.closing(self._connect()) as connection, connection:
-            if now is None:
-                row = connection.execute("SELECT MAX(timestamp) FROM hazards").fetchone()
-                now = row[0] if row and row[0] is not None else 0.0
+            return self._decay_and_prune(connection, now)
 
-            rows = connection.execute("SELECT hazard_id, timestamp FROM hazards").fetchall()
-            for hazard_id, entry_timestamp in rows:
-                elapsed = max(now - entry_timestamp, 0.0)
-                if self.decay_half_life_s > 0:
-                    decay_weight = 0.5 ** (elapsed / self.decay_half_life_s)
-                else:
-                    decay_weight = 1.0 if elapsed <= 0 else 0.0
-                connection.execute(
-                    "UPDATE hazards SET decay_weight = ? WHERE hazard_id = ?",
-                    (decay_weight, hazard_id),
-                )
+    def _decay_and_prune(self, connection: sqlite3.Connection, now: float) -> int:
+        rows = connection.execute("SELECT hazard_id, timestamp FROM hazards").fetchall()
+        updates = []
+        for hazard_id, entry_timestamp in rows:
+            elapsed = max(now - entry_timestamp, 0.0)
+            if self.decay_half_life_s > 0:
+                decay_weight = 0.5 ** (elapsed / self.decay_half_life_s)
+            else:
+                decay_weight = 1.0 if elapsed <= 0 else 0.0
+            updates.append((decay_weight, hazard_id))
+        connection.executemany(
+            "UPDATE hazards SET decay_weight = ? WHERE hazard_id = ?", updates
+        )
 
-            removed = connection.execute(
-                "DELETE FROM hazards WHERE decay_weight < ?",
-                (self.min_decay_weight,),
-            ).rowcount
-            removed = max(removed, 0)
+        removed = connection.execute(
+            "DELETE FROM hazards WHERE decay_weight < ?",
+            (self.min_decay_weight,),
+        ).rowcount
+        removed = max(removed, 0)
 
-            remaining = connection.execute("SELECT COUNT(*) FROM hazards").fetchone()[0]
-            overflow = remaining - self.max_entries
-            if overflow > 0:
-                stale_rows = connection.execute(
-                    """
-                    SELECT hazard_id FROM hazards
-                    ORDER BY (decay_weight * confidence) ASC, timestamp ASC
-                    LIMIT ?
-                    """,
-                    (overflow,),
-                ).fetchall()
-                connection.executemany(
-                    "DELETE FROM hazards WHERE hazard_id = ?", stale_rows
-                )
-                removed += len(stale_rows)
+        remaining = connection.execute("SELECT COUNT(*) FROM hazards").fetchone()[0]
+        overflow = remaining - self.max_entries
+        if overflow > 0:
+            stale_rows = connection.execute(
+                """
+                SELECT hazard_id FROM hazards
+                ORDER BY (decay_weight * confidence) ASC, timestamp ASC
+                LIMIT ?
+                """,
+                (overflow,),
+            ).fetchall()
+            connection.executemany(
+                "DELETE FROM hazards WHERE hazard_id = ?", stale_rows
+            )
+            removed += len(stale_rows)
 
         return removed
+
+    @staticmethod
+    def _entry(row: tuple) -> HazardEntry:
+        """HazardEntry from a row selected with _SELECT_COLUMNS."""
+        return HazardEntry(
+            object_id=row[0],
+            label=row[1],
+            world_x=row[2],
+            world_y=row[3],
+            confidence=row[4],
+            timestamp=row[5],
+            decay_weight=row[6],
+            velocity_x=row[7],
+            velocity_y=row[8],
+            hazard_id=row[9],
+            first_seen=row[10] if row[10] is not None else row[5],
+            times_seen=int(row[11]),
+            sessions_seen=int(row[12]),
+            last_session=row[13] or "",
+            belief=float(row[14]),
+            misses=int(row[15]),
+        )
 
     def get_hazards(self) -> list[HazardEntry]:
         """Load all remembered hazards from SQLite.
 
-        Runs a decay/prune pass first (using the latest stored timestamp
-        as "now"), so ranking always sees up-to-date decay_weight values
-        even if nothing new has been remembered since the last read.
+        Runs a decay/prune pass first (at `now_fn()`), so ranking always
+        sees up-to-date decay_weight values even if nothing new has been
+        remembered since the last read.
         """
 
-        self.decay_and_prune()
-
         with contextlib.closing(self._connect()) as connection, connection:
+            self._decay_and_prune(connection, float(self.now_fn()))
             rows = connection.execute(
-                """
-                SELECT
-                    object_id,
-                    label,
-                    world_x,
-                    world_y,
-                    confidence,
-                    timestamp,
-                    decay_weight,
-                    velocity_x,
-                    velocity_y,
-                    hazard_id
-                FROM hazards
-                ORDER BY timestamp DESC
-                """
+                f"SELECT {self._SELECT_COLUMNS} FROM hazards ORDER BY timestamp DESC"
             ).fetchall()
 
-        return [
-            HazardEntry(
-                object_id=row[0],
-                label=row[1],
-                world_x=row[2],
-                world_y=row[3],
-                confidence=row[4],
-                timestamp=row[5],
-                decay_weight=row[6],
-                velocity_x=row[7],
-                velocity_y=row[8],
-                hazard_id=row[9],
-            )
-            for row in rows
-        ]
+        return [self._entry(row) for row in rows]
 
     def reanchor(self, anchor_poses: dict[str, tuple[float, float, float]]) -> int:
         """Move anchored hazards with their SLAM keyframes.

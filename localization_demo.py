@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import os
 
-from navigation.memory import RouteMemory
+from navigation.memory import RouteMemory, SessionClock
 from navigation.models import Detection, Motion
 from navigation.sensing import SimulatedSensor, localize_detection
 
@@ -37,7 +37,9 @@ def main() -> None:
 
     if os.path.exists(DEMO_DB_PATH):
         os.remove(DEMO_DB_PATH)
-    memory = RouteMemory(DEMO_DB_PATH)
+    # Memory runs on epoch seconds: start time + the simulated pose time.
+    clock = SessionClock(live=False)
+    memory = RouteMemory(DEMO_DB_PATH, now_fn=clock)
 
     print("Simulated localization + memory demo")
     print("=" * 60)
@@ -52,7 +54,7 @@ def main() -> None:
             world_x=localized.world_x,
             world_y=localized.world_y,
             confidence=localized.confidence,
-            timestamp=localized.timestamp,
+            timestamp=clock.stamp(localized.timestamp),
         )
 
         print(f"\nFrame {frame_id}")
