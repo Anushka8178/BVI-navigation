@@ -3,10 +3,12 @@
 ## What this project is
 Context-aware navigation assistant for blind and visually impaired (BVI) users.
 YOLO detection → distance/direction → world-frame tracking → persistent hazard memory
-(with decay) → local path planner + urgent bypass → top-k acoustic attention → HRTF audio.
+(class-aware decay, reinforcement across walks, evidence-based forgetting) → local path planner
++ urgent bypass → top-k acoustic attention (sonified as memory early-warning cues) → HRTF audio.
 
-**Hard deadline: 8 Nov 2026 (final review/demo).** Prefer small, working, tested changes over
-big refactors. Do not add heavy new dependencies. Do not rewrite modules that already work.
+**Final evaluation: Tue 10 Nov 2026** (the Android rig below was built for the 8 Nov demo).
+Prefer small, working, tested changes over big refactors. Do not add heavy new dependencies.
+Do not rewrite modules that already work.
 
 ## Target setup for 8 Nov (the "Android rig")
 - **Camera:** Android phone, chest-mounted, running the *IP Webcam* app.
@@ -30,6 +32,10 @@ big refactors. Do not add heavy new dependencies. Do not rewrite modules that al
   HC-SR04 VCC → ESP32 3V3, GND → GND, Trig → GPIO5, Echo → 220R → GPIO18.
 - Laptop side: `navigation/range_sensor.py` (`RangeSensor`, pyserial background thread);
   `latest_m()` returns None if the reading is older than 300 ms or is -1.
+  `navigation/range_fusion.py` (config `range_fusion:`) fuses it with the detections each frame:
+  the nearest detection within ±7.5° takes the measured distance (if the camera estimate agrees
+  within ×2), an unexplained reading < 1.2 m adds an `unknown_obstacle` detection (urgent,
+  never stored in memory). Written and unit-tested before the hardware arrived.
 - The serial port and baud are configurable in `config.yaml` (`esp32:` section, default `COM5`;
   `--esp32-port` overrides), never hard-coded in logic. Check with `scripts/manual/check_esp32.py`.
 
@@ -40,10 +46,32 @@ big refactors. Do not add heavy new dependencies. Do not rewrite modules that al
     + `tests/test_memory.py` + the SQLite connection-closing fix (`contextlib.closing`).
   - `path-planner-hrtf-updated` → newest planner (TTC filtering, safety_margin 0.25) + HRTF
     physical→SOFA azimuth conversion, with path guidance played at the *walking* direction.
-- Main entry point: `video_navigation_demo_slam_memory.py`.
-- Modules: `navigation/` (models, yolo_perception, hazard, sensing, memory, planner, trajectory,
-  reasoning, audio, hrtf_renderer, vslam, minimap, slam_eval, synthetic_scene).
+- Main entry point: `video_navigation_demo_slam_memory.py`. Branch `memory-novelty` (from
+  `slam-vo`) adds the memory novelty; see `WORKLOG.md` for what changed and why.
+- Modules: `navigation/` (models, camera, config, yolo_perception, hazard, sensing, memory,
+  memory_reasoning, planner, trajectory, reasoning, audio, hrtf_renderer, range_sensor,
+  range_fusion, vslam, minimap, path_overlay, slam_eval, synthetic_scene).
   HRTF file: `hrtf/mit_kemar_normal_pinna.sofa`.
+- Config sections (`config.yaml`, loaded by `navigation/config.py`): camera, network, esp32,
+  range_fusion, pose, perception, hazard, planner, trajectory, memory, memory_reasoning,
+  attention, audio, slam.
+- **Persistent memory** (`navigation/memory.py`, config `memory:`): SQLite, uuid `hazard_id`,
+  matching by track hint then same-label nearest neighbour within `match_radius_m`.
+  - Clock: epoch seconds (`SessionClock`: wall clock live, run start + video time for files),
+    injectable `now_fn`. Each run has a `session_id`. Rows store `first_seen`, `times_seen`,
+    `sessions_seen`, `last_session`, `belief`, `misses` (columns ALTERed into old databases).
+  - Class-aware decay: `categories` (dynamic 10 s, temporary 2 h, permanent 14 days half-life),
+    half-life × min(1 + 0.5 × (sessions_seen − 1), 3); pruned below `min_decay_weight`.
+    `RouteMemory.from_config()` builds it.
+- **Reasoning over memory** (`navigation/memory_reasoning.py`, config `memory_reasoning:`, pure):
+  `update_negative_evidence` (a static hazard expected in clear view but not detected loses
+  belief and is forgotten after 4 misses) and `MemoryEarlyWarning` / `select_memory_cues` (remembered,
+  confirmed, currently unseen static hazard 2.5–8 m ahead within ±40° → one soft HRTF memory cue,
+  ranked by `AcousticAttention`, cooldowns, suppressed by urgent/path cues; lead time logged).
+  `HRTFRenderer.play_memory_cue` has its own timbre and the lowest queue priority.
+- **Evaluation**: `tools/eval_memory.py` (memory ablation A/B/C/D over 3 simulated walks, output in
+  `runs/memory_eval/`), `tools/simulate_slam_walk.py`, `tools/eval_walk_drift.py`,
+  `tools/eval_slam_tum.py`.
 - **Visual SLAM** (`--pose slam`, `navigation/vslam.py`, config `slam:`): keyframe monocular VO
   (ORB + essential matrix, dynamic YOLO boxes masked), scale from phone steps (or
   `slam.assumed_speed_m_s`), heading fused with the phone, loop closure (triangulation + PnP,
@@ -58,18 +86,30 @@ big refactors. Do not add heavy new dependencies. Do not rewrite modules that al
   (flat ground, `perception.camera_height_m`) and a severity bonus (`hazard.ground_hazard_bonus`).
   Needs `ultralytics>=8.4`.
 
-## Known bugs to fix (verified in the code)
-1. **Pose doesn't follow the video:** `simulated_pose(t)` invents motion. Fixed: use `--pose phone`
-   (dead reckoning) or `--pose slam` (visual SLAM).
-2. **Heading convention mismatch:** `AcousticAttention` uses forward = (sin h, cos h), i.e. heading
-   clockwise from +y, but `local_to_world` rotates counter-clockwise, and `simulated_pose` walks along +x
-   at heading 0.
-3. **Decay not on main:** `RouteMemory.remember()` hard-codes `decay_weight = 1.0`.
-4. **IDs collide:** `object_id = f"{label}-{track_id}"`, and YOLO track IDs restart every run.
-5. **Blocking audio:** `sounddevice` playback with `blocking=True` freezes the frame loop.
-6. **Inconsistent config:** parameters are duplicated in code and the docs disagree (safety margin 0.50 vs 0.25).
-7. **Tests split:** pytest-style functions are run with `unittest discover`, and test files are scattered
-   at the repo root.
+## Known bugs (status re-verified in the code on `memory-novelty`, 8 Nov 2026)
+Fixed:
+1. ~~Pose doesn't follow the video~~: `--pose phone` (dead reckoning) or `--pose slam` (visual SLAM).
+   `--pose sim` (default for video files) still invents motion: memory, negative evidence and
+   memory cues are only meaningful with `slam` or `phone`.
+2. ~~Heading convention mismatch~~: `local_to_world`, `world_to_local`, `AcousticAttention`,
+   `simulated_pose` (walks along +y at heading 0) and the planner all use heading clockwise from
+   +y (`tests/test_frames.py`).
+3. ~~Decay not on main~~: decay + pruning are on this branch, now class-aware with reinforcement
+   and an epoch memory clock (`tests/test_memory.py`, `tests/test_memory_decay_classes.py`).
+   (Still not on `main` until this branch is merged.)
+4. ~~IDs collide~~: stable uuid `hazard_id`; the YOLO track id is only a per-run hint.
+5. ~~Blocking audio~~: `HRTFRenderer` queues cues for a worker thread (`tests/test_hrtf_audio.py`).
+6. ~~Inconsistent config~~: every tunable is in `config.yaml`; `tests/test_config.py` checks the
+   sections match the constructors; safety margin is 0.25 everywhere.
+7. ~~Tests split~~: all automated tests are pytest files in `tests/` (`pytest.ini`); manual
+   hardware checks are in `scripts/manual/`.
+
+Still open:
+- Monocular distance is approximate (object height / box bottom edge) until the ultrasonic
+  sensor is fitted; ground-level classes cannot be seen closer than ~2.5 m (camera model).
+- The memory evaluation is a simulation, not a user study; live two-walk tests are still needed.
+- `README.md` still describes some older demos (`main.py`, the six-tier console demo) that are
+  not on this branch.
 
 ## Conventions (follow exactly)
 - **World frame:** x = right of the start heading, y = forward at the start, metres.
@@ -81,6 +121,11 @@ big refactors. Do not add heavy new dependencies. Do not rewrite modules that al
 - **Azimuth for audio:** negative = left, 0 = ahead, positive = right (physical). Convert to SOFA's
   convention only inside `hrtf_renderer.py`.
 - The planner gets **current-frame hazards only**. Memory is for context and attention, never to block the path.
+  Memory cues are audio only and never change the planner.
+- **Memory clock:** persistent memory uses epoch seconds (`SessionClock`); tracking and TTC keep
+  the pipeline clock. Tests inject a fake clock (`now_fn`) — never rely on "newest stored timestamp".
+- **Audio priority:** urgent (where the danger is) > path guidance (where to walk) > memory cue
+  (remembered hazard ahead). A lower kind never displaces a higher one.
 - Every tunable number goes in `config.yaml`, loaded once and passed to the constructors.
 
 ## Workflow rules for Claude

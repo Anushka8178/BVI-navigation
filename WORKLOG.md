@@ -1,6 +1,64 @@
 # WORKLOG: memory-novelty branch
 
-(The final summary goes at the top when all tasks are done.)
+## Final summary (8 Nov 2026, for the 10 Nov evaluation)
+
+**All 7 tasks are done and committed, one commit per task, on `memory-novelty` (from `slam-vo`).**
+Tests: **217 passed** (baseline 147, so 70 new; all hardware-free), `python -m pytest -q`, about 25 s.
+
+Done
+1. Memory clock + journeys: epoch `SessionClock`, injectable `now_fn`, `session_id`,
+   `first_seen/times_seen/sessions_seen/last_session/belief/misses` (old DBs migrate).
+2. Class-aware decay (dynamic 10 s / temporary 2 h / permanent 14 days half-life) with
+   reinforcement across walks (x1.5 per extra walk, capped at x3).
+3. Evidence-based forgetting (`navigation/memory_reasoning.py`): a static hazard missed 4 times in
+   clear view is forgotten; occlusion, FOV, range and ground-visibility guards.
+4. Memory early warning: `select_memory_cues` + `MemoryEarlyWarning` + `HRTFRenderer.play_memory_cue`
+   (own two-pip timbre, lowest priority, suppressed by urgent/path cues). Console, status panel,
+   mini-map ring, `memory_cues` / `memory_summary` in the JSON report, lead time when confirmed.
+5. ESP32 ultrasonic fusion (`navigation/range_fusion.py`): distance fix + `unknown_obstacle`.
+   Ready, but not tried on hardware.
+6. `tools/eval_memory.py`: 4-variant ablation over 3 simulated walks (CSV, markdown, PNG).
+7. README novelty table (claim → code → test → evidence), two-walk demo instructions, CLAUDE.md
+   updated, honest limitations in README and the JSON report.
+
+Evaluation (simulation, SLAM pose model sigma 0.15 m, 5 seeded runs pooled; `runs/memory_eval/`)
+
+| Variant | Walk | Remembered at start | Warned before camera alert % (lead s) | Warned before 1st detection % (lead s) | Stale / false cues | False hazards in memory | Removed still remembered | Memory cues/min | All cues/min | Pos. error m |
+|---|---|---|---|---|---|---|---|---|---|---|
+| A no memory | S2 / S3 | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 | - | - | 0 / 0 | 22.5 / 19.7 | - |
+| B 30 s decay | S2 / S3 | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 | 13.2 / 9.2 | 0 / 0 | 0 / 0 | 22.5 / 19.7 | 0.28 / 0.24 |
+| C class decay + cues | S2 / S3 | 11.6 / 21.4 | 48.9 (3.65) / 33.3 (4.12) | 28.9 (0.32) / 27.5 (1.96) | 0 / 2.0 stale | 18.8 / 24.2 | 0 / 1.6 | 4.74 / 4.88 | 27.2 / 24.6 | 0.27 / 0.24 |
+| D full | S2 / S3 | 9.0 / 12.2 | 48.9 (3.65) / 33.3 (3.42) | 28.9 (0.32) / 22.5 (1.42) | 0 / 2.0 stale | **7.6 / 6.8** | **0 / 0** | 4.74 / 4.47 | 27.2 / 24.1 | 0.27 / 0.25 |
+
+(S1 is the first walk: no warnings from earlier walks are possible; 13.6 % of hazards still get a
+within-walk memory cue before the alert, after being seen and then hidden. False cues are 0 in every
+row after the `cue_min_sightings` fix. Objects lost from memory by negative evidence: 0 in every row.)
+Phone dead reckoning: remembered positions 3.1-3.3 m off, cue direction error 13-18 deg
+(SLAM model: 1.6-2.8 deg). Real VisualSLAM on rendered frames (1 run, new map each walk):
+1.8-1.9 m, 9-12 deg; warned before the camera alert 37.5-55.6 % in walks 2-3 (single run, small counts).
+
+How to read it honestly
+- The memory cue mainly gives warning **before the camera's alert** (about 3.5-4 s, from about 8 m),
+  not before the first detection (cue range = camera range = 8 m, so only 0.3-2 s there).
+- Negative evidence is what keeps memory clean (false hazards 7 vs 24 rows, removed objects forgotten,
+  no real object lost). It cannot prevent the first stale cue for an object removed round a corner.
+- The SLAM noise model is optimistic; the rendered VisualSLAM check drifted 1.8-1.9 m over 80 m.
+- Memory cues add about 2-5 cues/min to about 20/min of urgent+path cues: a real cognitive-load cost.
+
+Still needs real-world testing
+- Live two-walk test on campus with `--pose slam` (relocalization at the start mark, memory cues,
+  forgetting a removed cone). Listen to `scripts/manual/test_memory_cue.py` with the wired earphones.
+- Camera calibration (`scripts/manual/calibrate_camera.py`) for better SLAM and distances.
+- ESP32 + HC-SR04: `scripts/manual/check_esp32.py`, then a live run; check the `range_fusion` block.
+
+Risks
+- With `--pose sim` (the default for video files), memory, negative evidence and memory cues are
+  meaningless (the pose doesn't follow the video). Use `--pose slam` for any memory demo.
+- Memory cue thresholds (2.5-8 m, 40 deg, 8 s / 2 s cooldowns, 3 sightings) were chosen once and
+  not tuned with users.
+- `navigation_memory.db` files from before this branch are migrated; rows with video-time
+  timestamps are re-stamped as "seen now" (their real age is unknown).
+- `git push` result: see the end of this file.
 
 ## 0. Setup
 
@@ -302,3 +360,47 @@ agreeing close reading corrects instead of adding; config section.
 
 Not tested on hardware (sensor not here yet): run `scripts/manual/check_esp32.py`, then a live
 run without `--no-esp32` and check `range_fusion` in the JSON report.
+
+### Task 6 results (final runs, from the committed code)
+
+Commands: `python tools/eval_memory.py` (SLAM model, seeds 7-11, about 105 s),
+`python tools/eval_memory.py --pose-model phone --out runs/memory_eval_phone`,
+`python tools/eval_memory.py --render-slam --runs 1 --out runs/memory_eval_vslam` (about 5 min).
+Full tables are in `runs/memory_eval*/results.md` (git-ignored). The summary table is at the top of this file.
+
+Unexpected results, explained (not tuned away)
+- **Short lead before the first detection (0.3-2 s).** The cue window (2.5-8 m) and the camera range
+  (1-8 m) are the same, so memory can only be earlier when the camera has not had its first hit,
+  is occluded, or the hazard is round a corner (cue at <= 40 deg, camera FOV +-35 deg). The useful
+  lead is before the camera **alert** (urgent at about 2.5 m): 3.4-4.1 s.
+- **Two stale cues in walk 3 in both C and D**: the repaired pothole sits 4.4 m round a corner. The
+  first cue fires from about 9 m away at 30 deg, the second mid-turn, both before the camera has a clear
+  view. D then forgets it (0 removed objects remembered); C keeps it.
+- **D warns slightly less than C in walk 3 before the first detection (22.5 vs 27.5 %, i.e. 9 vs 11 of 40
+  hazard-walks).** C keeps noisy duplicate rows (35 vs 16 rows); a duplicate placed a bit nearer
+  sometimes fires the cue earlier. D forgot 1 present-object row per walk; 0 objects were lost.
+- **Phone pose**: longer "lead" numbers (2.9-4.4 s before detection) are partly an artefact.
+  Remembered positions are about 3 m off, so cues fire for the right object at the wrong place
+  (cue direction error 13-18 deg). Negative evidence forgets misplaced rows (3.8 per walk in walk 3)
+  and re-learns them.
+- **Rendered VisualSLAM** (single run): 1.8-1.9 m position error, much worse than the 0.15 m noise
+  model. The rendered room is 28 m wide (walls 4-24 m away), a single lap has no loop closure until
+  the end, and each walk starts a new map (the simulation does not relocalize into the previous map
+  or re-anchor hazards, unlike the demo). Treat it as a pessimistic check.
+
+## Task 7: documentation and honesty pass
+
+What changed
+- `README.md`: new section **"Novelty → where it is in the code → how it is tested → evidence"**
+  (7 claims), "Memory evaluation (simulation)" with commands and an honest reading of the numbers,
+  "Two-walk memory demonstration (live)", SQL example with the journey columns, stale
+  "decay not implemented" note fixed, limitations extended (monocular distance, ground visibility,
+  simulation is not a user study, memory needs a good pose, first stale cue round a corner).
+- `CLAUDE.md`: final evaluation date (10 Nov), modules list, config sections, memory /
+  reasoning / evaluation summary, range fusion, conventions (memory clock, audio priority,
+  memory cues never touch the planner). Known bugs 1-7 re-verified in the code and marked fixed,
+  with what is still open.
+- Demo JSON `limitations`: monocular distance (and whether the ultrasonic sensor was used),
+  ground-level visibility, simulation-only evaluation, pose quality for memory.
+
+Result: `python -m pytest -q` gives **217 passed**.

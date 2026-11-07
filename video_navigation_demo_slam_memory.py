@@ -1338,7 +1338,24 @@ def main() -> None:
             ),
         },
         "limitations": [
-            "Distance is estimated from object height and bounding-box size, not measured depth.",
+            (
+                "Distance is monocular (object height, or box bottom edge for ground-level "
+                "classes), not measured depth"
+                + (
+                    "; the ESP32 ultrasonic sensor corrects the detection straight ahead "
+                    "when it has a fresh reading."
+                    if range_sensor is not None
+                    else "; the ESP32 ultrasonic sensor was not used (--no-esp32)."
+                )
+            ),
+            "Ground-level hazards are only in view from about "
+            f"{1.9 * float(perception_cfg['camera_height_m']):.1f} m ahead (chest camera model), "
+            "so memory cannot confirm or forget them closer than that.",
+            "Memory early-warning cues and evidence-based forgetting were evaluated in "
+            "simulation (tools/eval_memory.py), not in a user study.",
+            "Remembered positions are only as consistent as the pose: visual SLAM keeps them "
+            "within a few tens of cm in simulation, phone dead reckoning drifts by metres per "
+            "walk, and the simulated pose (--pose sim) does not follow the video at all.",
             (
                 "Pose is phone heading + step counting (stride from config); "
                 "position drifts over long walks."

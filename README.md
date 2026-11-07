@@ -13,6 +13,76 @@ This project contains both a deterministic architecture prototype and a real, da
 - The path planner returns both a route and a human-readable reason.
 - If localization fails, current-frame detection and alerts continue without unsafe world-memory updates.
 
+## Novelty → where it is in the code → how it is tested → evidence
+
+The evidence column comes from `tools/eval_memory.py` (a **simulation**, not a user study; see
+"Memory evaluation" below). Numbers are for walk 2 (day 2) and walk 3 (day 9), SLAM pose model,
+5 seeded runs, unless stated otherwise. Variants: A no memory, B the old 30 s time-only decay,
+C class-aware decay + reinforcement + memory cues, D = C + evidence-based forgetting.
+
+| Claim | Where in the code | How it is tested | Evidence |
+|---|---|---|---|
+| **Persistent cross-journey memory** (epoch clock, sessions, reinforcement) | `navigation/memory.py`: `SessionClock`, `RouteMemory(session_id, now_fn)`, `first_seen/times_seen/sessions_seen/last_session`, `effective_half_life()` | `tests/test_memory.py`, `tests/test_memory_decay_classes.py` | Static hazards remembered when walk 2 / walk 3 starts: B **0 / 0**, D **9.0 / 12.2** (C 11.6 / 21.4 incl. duplicates and false positives) |
+| **Class-aware decay and pruning** (person ~43 s, cone ~8.6 h, pothole ~60 days; longer when seen on several walks) | `config.yaml` `memory.categories`, `RouteMemory.half_life_for()`, `decay_and_prune()` | `tests/test_memory_decay_classes.py` (pothole survives 2 days, person gone in 1 min, cone in 1 day, 3-walk reinforcement) | B forgets everything between walks; C/D keep the permanent hazards and let the cones and barriers fade |
+| **Evidence-based forgetting** (missed in clear view → forgotten) | `navigation/memory_reasoning.py` `update_negative_evidence()`, `RouteMemory.record_miss()/forget()` | `tests/test_memory_reasoning.py` (4 spaced misses, occlusion, FOV/range limits, dynamic labels, invalid pose, sighting restores belief) | False hazards in memory after walk 3: C **24.2** vs D **6.8**; removed objects still remembered: C 1.6 vs D **0**; real objects lost from memory: **0** |
+| **Memory early warning** = sonified top-k acoustic attention | `memory_reasoning.select_memory_cues()`, `MemoryEarlyWarning`, `HRTFRenderer.play_memory_cue()`, demo `MEMORY CUE` | `tests/test_memory_cues.py` (fake renderer), `tests/test_hrtf_audio.py` | Hazards with a memory cue before the camera's first urgent/path alert: walk 2 **48.9 %**, walk 3 **33.3 %**, mean **3.4-4.1 s** earlier (A, B: 0 %). Before the camera's *first detection*: 22-29 %, but only 0.3-2 s earlier (cue range = camera range, 8 m) |
+| **Separate urgent / path / memory cues** | `HRTFRenderer`: three timbres, priority queue (urgent > path > memory); demo suppresses memory cues when urgent/path is due | `tests/test_hrtf_audio.py`; listening check `scripts/manual/test_memory_cue.py` | Memory cues 1.8-4.9 per minute; all cues 20-22/min (A) vs 23-27/min (C/D): the cost of the early warnings |
+| **SLAM-consistent world frame with re-anchoring** | `navigation/vslam.py`, saved map + relocalization, `RouteMemory.reanchor()` | `tests/test_vslam.py` | Position error of remembered hazards: SLAM noise model 0.25 m, cue direction error 1.6-2.8°; phone dead reckoning 3.1-3.3 m, 13-18°; real VisualSLAM on rendered frames (1 run, new map each walk) 1.8-1.9 m, 9-12° |
+| **Explainable guidance** | planner `PathDecision.reason`; `MemoryCue.describe()` ("pothole ahead-left 4.2 m \| seen in 2 earlier walks, last 2 days ago"); JSON report `path_events`, `memory_cues`, `memory_summary`, `negative_evidence` | `tests/test_planner.py`, `tests/test_memory_cues.py` (exact console line) | Every cue and every forgetting decision is logged with its reason |
+
+Full tables: `runs/memory_eval/results.md` (SLAM model), `runs/memory_eval_phone/results.md`,
+`runs/memory_eval_vslam/results.md` (generated, git-ignored; re-create them with the commands
+below). `WORKLOG.md` has the parameters, the decisions and the bugs the evaluation found.
+
+### Memory evaluation (simulation)
+
+```powershell
+python tools/eval_memory.py                                   # SLAM pose model, 5 seeded runs (~2 min)
+python tools/eval_memory.py --pose-model phone --out runs\memory_eval_phone
+python tools/eval_memory.py --render-slam --runs 1 --out runs\memory_eval_vslam   # real VisualSLAM, ~5 min
+```
+
+An 80 m square campus loop with 10 static hazards and passing pedestrians is walked three times:
+day 0, day 2 (a cone removed, a new barrier), day 9 (a pothole repaired). A simulated camera
+(70° FOV, 1-8 m, p_detect 0.85, 10 % distance noise, 2° bearing noise, occlusion by people,
+0.01 false positives per frame) feeds the **real** memory, attention, negative-evidence, planner
+and hazard modules. Output: `results.csv`, `results.md` and `results.png` in `--out`.
+
+What the numbers say, including the parts that are not flattering:
+
+- Memory early warnings mostly help **before the camera alert**, not before the first
+  detection. The camera already sees up to 8 m, the same as the cue range, but the user only
+  hears about a hazard when it becomes urgent (about 2.5 m). The memory cue arrives 3.4-4.1 s
+  earlier than that, from about 8 m.
+- Negative evidence cannot stop the *first* stale cue for an object removed round a corner
+  (2 stale cues for the repaired pothole in walk 3 in both C and D). It forgets the object once
+  the camera has had a clear look, so walk 4 would not repeat it. C would.
+- C warns slightly more often than D in walk 3 (27.5 % vs 22.5 % before the first detection).
+  C's extra duplicate rows occasionally fire a cue earlier. D cleans them up and loses no object.
+- Memory is only as good as the pose: phone dead reckoning puts remembered hazards about 3 m off,
+  so its cues point 13-18° away from the object. The SLAM noise model (0.15 m) is optimistic;
+  the real VisualSLAM on rendered frames was 1.8-1.9 m off over this 80 m loop (single run,
+  no relocalization into the previous walk's map in the simulation).
+
+### Two-walk memory demonstration (live)
+
+1. Tape a start mark. Walk 1 builds the SLAM map and the memory:
+   `python video_navigation_demo_slam_memory.py --pose slam --slam-new-map --reset --trajectory-out runs\walk1.csv`
+2. Between the walks, remove one cone (do walk 2 within a few hours: cones fade after ~8.6 h anyway).
+3. Walk 2, from the same start mark facing the same way, **without** `--reset`:
+   `python video_navigation_demo_slam_memory.py --pose slam --trajectory-out runs\walk2.csv`
+   SLAM relocalizes in the saved map. Remembered hazards ahead that the camera does not see yet get
+   a soft two-pip cue and a console line such as
+   `MEMORY CUE | pothole ahead-left 4.2 m | seen in 1 earlier walk, last 12 min ago`, plus an amber
+   ring on the mini-map. Looking at the empty spot of the removed cone gives
+   `MEMORY | forgot reflective_cone ...: not seen in clear view 4 times`.
+4. The JSON report next to the video lists `memory_cues` (with lead time when the camera later
+   confirms the hazard), `memory_summary` and `negative_evidence`.
+
+On a recorded video, run the same video twice on the same database with
+`--pose slam --no-phone` (the second run relocalizes in the saved map). `--pose sim` invents the
+motion and is **not** suitable for memory demonstrations.
+
 ## Run on Windows or Linux
 
 Python 3.10 or newer is sufficient. No GPU is required.
@@ -289,13 +359,24 @@ FROM hazards
 ORDER BY timestamp DESC
 LIMIT 15;
 
+-- Journeys: how often / on how many walks each hazard was seen, and how
+-- much memory still trusts it (time decay x existence belief).
+SELECT label, sessions_seen, times_seen, round(decay_weight, 3) AS decay,
+       round(belief, 2) AS belief, misses,
+       datetime(first_seen, 'unixepoch', 'localtime') AS first_seen,
+       datetime(timestamp, 'unixepoch', 'localtime') AS last_seen
+FROM hazards
+ORDER BY sessions_seen DESC, timestamp DESC
+LIMIT 15;
+
 .quit
 ```
 
 `.schema hazards` shows the table was created by `RouteMemory._create_table()`,
 not hand-edited. The `SELECT` returns real rows written during the video
 run: object ID, label, the world-frame coordinates from `local_to_world()`,
-detection confidence, and the last-seen timestamp.
+detection confidence, and the last-seen timestamp (epoch seconds: wall clock
+for live runs, run start + video time for recorded videos).
 
 If `sqlite3` isn't installed, the same data is reachable from Python's
 built-in `sqlite3` module without installing anything extra:
@@ -309,7 +390,7 @@ python -c "import sqlite3; c = sqlite3.connect('navigation_memory.db'); c.row_fa
 1. Start with `NavigationPipeline.process_cycle()` in `navigation/pipeline.py`. It is the architecture in executable form.
 2. Point out that urgent detections call the audio renderer immediately, before memory ranking.
 3. Point out that memory update is a separate unconditional step, so “bypass” means bypassing ranking latency, not skipping storage.
-4. Show `RouteMemory` (`navigation/memory.py`) and `AcousticAttention.rank()` (`navigation/reasoning.py`) as the main research contribution. **Note:** the time-decay/pruning behavior (`SpatialMemory.decay_and_prune()`) described in earlier drafts of this architecture is not implemented on this branch — `RouteMemory` persists hazards but does not currently age or prune them.
+4. Show `RouteMemory` (`navigation/memory.py`), `navigation/memory_reasoning.py` and `AcousticAttention.rank()` (`navigation/reasoning.py`) as the main research contribution: class-aware decay and pruning (`decay_and_prune()`), reinforcement across walks, evidence-based forgetting and memory early-warning cues (see "Novelty" above).
 5. Stop localization for one frame in the demo and show graceful degradation.
 6. Restart the program without `--reset` and show that route hazards remain in SQLite.
 
@@ -324,8 +405,20 @@ python -c "import sqlite3; c = sqlite3.connect('navigation_memory.db'); c.row_fa
   `--pose phone` is phone dead reckoning, `--pose sim` is a deterministic
   simulated trajectory.
 - YOLO's tracker can assign a new ID to the same physical object after
-  occlusion or brief loss of track, so persistent-memory object counts can
-  run higher than the number of distinct real-world objects actually
-  present.
+  occlusion or brief loss of track. Memory matches by position (same label
+  within `memory.match_radius_m`), but a noisy far-away first sighting can
+  still create a duplicate row; negative evidence removes most of them.
+- Distance is monocular (object height, or box bottom edge for ground-level
+  classes) unless the ESP32 ultrasonic sensor is fitted; ground-level hazards
+  are only in view from about 2.5 m ahead with the chest camera model.
+- The memory evaluation (`tools/eval_memory.py`) is a simulation with a
+  simulated detector and pose error. It is **not a user study**: it shows what
+  the memory logic does, not how blind users respond to the cues. Live
+  two-walk tests are still needed.
+- Memory is only as good as the world frame: with `--pose phone` remembered
+  positions drift by metres per walk (about 3 m in the simulation), and
+  `--pose sim` does not follow the video at all.
+- Negative evidence cannot stop the *first* stale cue for an object removed
+  around a corner. It forgets the object once the camera has had a clear look.
 
 These are adapter-level limitations, not architectural shortcuts. The safety path, memory behavior, prioritization, persistence, explainability, and failure handling are executable.
