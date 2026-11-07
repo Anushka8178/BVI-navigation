@@ -88,6 +88,16 @@ class SessionClock:
     def __call__(self) -> float:
         return self._now
 
+    def start_after(self, latest: float | None, gap_s: float = 1.0) -> None:
+        """Recorded video: start at least `gap_s` after `latest` (the newest
+        timestamp already in memory), so this run is always later than an
+        earlier run even if that one replayed faster than real time."""
+        if self.live or latest is None:
+            return
+        if self.run_start_epoch < latest + gap_s:
+            self.run_start_epoch = latest + gap_s
+            self._now = self.run_start_epoch
+
 
 @dataclass
 class HazardEntry:
@@ -400,7 +410,7 @@ class RouteMemory:
         candidates = connection.execute(
             """
             SELECT hazard_id, object_id, world_x, world_y, timestamp,
-                   velocity_x, velocity_y
+                   velocity_x, velocity_y, last_session
             FROM hazards WHERE label = ?
             """,
             (label,),
@@ -408,10 +418,15 @@ class RouteMemory:
 
         best_id = None
         best_distance = self.match_radius_m
-        for hazard_id, stored_object_id, x, y, seen_at, vx, vy in candidates:
+        for hazard_id, stored_object_id, x, y, seen_at, vx, vy, session in candidates:
             # Already updated this frame by another detection: one
             # detection per hazard per frame keeps nearby objects apart.
-            if seen_at >= timestamp and stored_object_id != object_id:
+            # (Only this session's frames: another run's clock may differ.)
+            if (
+                session == self.session_id
+                and seen_at >= timestamp
+                and stored_object_id != object_id
+            ):
                 continue
 
             if label in self.dynamic_labels:
@@ -654,6 +669,12 @@ class RouteMemory:
             ).fetchall()
 
         return [self._entry(row) for row in rows]
+
+    def latest_timestamp(self) -> float | None:
+        """Newest last-seen timestamp in memory (None if empty)."""
+        with contextlib.closing(self._connect()) as connection:
+            row = connection.execute("SELECT MAX(timestamp) FROM hazards").fetchone()
+        return None if row is None or row[0] is None else float(row[0])
 
     def record_miss(self, hazard_id: str, miss_factor: float) -> HazardEntry | None:
         """Negative evidence: the hazard was expected in clear view but not

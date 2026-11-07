@@ -20,6 +20,7 @@ STATE_COLORS = {
     "LOST": (60, 60, 255),
     "INIT": (200, 200, 200),
 }
+MEMORY_CUE_COLOR = (0, 200, 255)  # amber (BGR): hazard that just got a memory cue
 
 
 def draw_minimap(
@@ -36,12 +37,15 @@ def draw_minimap(
     lanes: Sequence[tuple[float, bool, bool]] = (),
     lane_width_m: float = 0.65,
     lane_length_m: float = 5.0,
+    highlight: tuple[float, float] | None = None,
 ) -> None:
     """Draw the mini-map in place in the bottom-right corner.
 
-    hazards: (world_x, world_y, label, decay_weight).
+    hazards: (world_x, world_y, label, trust 0..1).
     lanes: planner lanes as (lateral_offset_m, safe, selected), drawn
     from the current pose along its heading.
+    highlight: world (x, y) of the hazard that just got a memory cue,
+    drawn with an amber ring.
     """
     h_img, w_img = image.shape[:2]
     size = min(size, int(0.45 * h_img), w_img - 2 * margin)
@@ -57,6 +61,8 @@ def draw_minimap(
     hazards = list(hazards)
     loop_links = list(loop_links)
     pts = list(trajectory) + keyframes + [(hx, hy) for hx, hy, _l, _w in hazards] + [pose[:2]]
+    if highlight is not None:
+        pts.append(tuple(highlight))
     xs = [p[0] for p in pts]
     ys = [p[1] for p in pts]
     span = max(max(xs) - min(xs), max(ys) - min(ys), 6.0) * 1.15
@@ -87,6 +93,8 @@ def draw_minimap(
         p = to_px(hx, hy)
         cv2.circle(panel, p, 4, (0, 0, shade), -1)
         cv2.putText(panel, label[:8], (p[0] + 5, p[1] - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 0, shade), 1)
+    if highlight is not None:
+        cv2.circle(panel, to_px(*highlight), 9, MEMORY_CUE_COLOR, 2, cv2.LINE_AA)
 
     if lanes:
         hr = math.radians(pose[2])

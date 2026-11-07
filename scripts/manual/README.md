@@ -14,6 +14,7 @@ python -m scripts.manual.test_hrtf
 | `check_phone_pose.py` | phone running SensorServer | Prints live heading, x, y, steps (`--seconds 20`) |
 | `test_audio_device.py` | audio device | Lists/finds the named output device via `sounddevice` |
 | `test_hrtf.py` | earphones | Plays HRTF warnings at left / ahead / right |
+| `test_memory_cue.py` | earphones | Memory early-warning cue (two soft low pips) at left / ahead / right, then path and urgent cues for comparison (`--audio-device`) |
 | `test_pipeline_audio.py` | earphones | Same as above with console labels |
 | `test_navigation_audio.py` | earphones | Fake obstacle through `NavigationPipeline`, prints warnings |
 | `test_video_hrtf.py` | earphones | Same idea, positions swept for a video-sync demo |

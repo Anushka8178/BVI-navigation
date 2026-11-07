@@ -11,6 +11,9 @@ from scipy import signal
 
 URGENT = "urgent"
 SOFT = "soft"
+# Memory early warning: a remembered hazard the camera does not see now.
+# Lowest priority: never displaces an urgent or path-guidance cue.
+MEMORY = "memory"
 
 # Name fragments that mark an output as Bluetooth. Bluetooth adds about
 # 100-250 ms of latency, so it is only used when nothing else exists.
@@ -187,6 +190,7 @@ class _Cue:
     kind: str
     azimuth_deg: float
     cancelled: bool = False
+    distance_m: float = 0.0
 
 
 class HRTFRenderer:
@@ -212,10 +216,23 @@ class HRTFRenderer:
 
     exactly once, immediately before HRTF lookup.
 
-    Playback is asynchronous: play_warning() and play_path_guidance()
-    only put a cue on a small queue (max_queue items) and return at once.
-    A background worker renders and plays the cues. Urgent cues drop any
-    queued soft cues and interrupt a soft cue that is already playing.
+    Playback is asynchronous: play_warning(), play_path_guidance() and
+    play_memory_cue() only put a cue on a small queue (max_queue items)
+    and return at once. A background worker renders and plays the cues.
+
+    Priority: urgent > path guidance (soft) > memory.
+      - Urgent cues drop every queued non-urgent cue and interrupt a soft
+        or memory cue that is already playing.
+      - A path cue on a full queue replaces the oldest memory cue first,
+        then the oldest path cue.
+      - A memory cue never displaces anything: on a full queue it is
+        dropped.
+
+    Three timbres, so users can tell them apart:
+      urgent  700 + 1050 Hz, 0.5 s, loud (where the danger is)
+      path    420 + 620 Hz, 0.45 s, softer (where to walk)
+      memory  two short low pips, 330 + 495 Hz, quietest (a remembered
+              hazard ahead that the camera does not see yet)
     """
 
     def __init__(
@@ -228,6 +245,7 @@ class HRTFRenderer:
         path_guidance_cooldown=1.0,
         bluetooth_keywords=BLUETOOTH_KEYWORDS,
         headphone_keywords=HEADPHONE_KEYWORDS,
+        memory_cue_cooldown=2.0,
     ):
         print("Loading HRTF file...")
 
@@ -261,6 +279,13 @@ class HRTFRenderer:
             path_guidance_cooldown
         )
         self.last_path_guidance_time = 0.0
+
+        # --------------------------------------------------
+        # Memory early-warning cooldown
+        # --------------------------------------------------
+
+        self.memory_cue_cooldown = float(memory_cue_cooldown)
+        self.last_memory_cue_time = 0.0
 
         # --------------------------------------------------
         # Output backend
@@ -881,6 +906,64 @@ class HRTFRenderer:
             )
 
     # ======================================================
+    # MEMORY EARLY-WARNING SOUND
+    # ======================================================
+
+    @staticmethod
+    def memory_cue_level(distance_m) -> float:
+        """Output level of a memory cue: 0.32 at <= 3 m down to 0.22 at
+        >= 8 m. Always below path guidance (0.50) and urgent (0.85)."""
+        d = min(max(float(distance_m), 3.0), 8.0)
+        return 0.32 - 0.10 * (d - 3.0) / 5.0
+
+    def create_memory_cue_sound(
+        self,
+        azimuth_deg=0.0,
+        distance_m=4.0,
+    ):
+        """Two short, soft, low pips from the remembered hazard's direction.
+
+        azimuth_deg uses the PROJECT physical convention.
+        """
+
+        pip_s, gap_s = 0.09, 0.08
+
+        try:
+            pip_count = int(self.sample_rate * pip_s)
+            gap_count = int(self.sample_rate * gap_s)
+            t = np.arange(pip_count) / self.sample_rate
+
+            pip = (
+                0.70 * np.sin(2 * np.pi * 330 * t)
+                + 0.30 * np.sin(2 * np.pi * 495 * t)
+            )
+            pip *= self._envelope(self.sample_rate, pip_count, 0.015)
+
+            tone = np.concatenate((pip, np.zeros(gap_count), pip))
+
+            return self._spatialize(
+                tone,
+                azimuth_deg,
+                self.memory_cue_level(distance_m),
+            )
+
+        except Exception as error:
+
+            print(
+                f"Could not create memory "
+                f"cue sound: {error}"
+            )
+
+            count = int(self.sample_rate * pip_s)
+            t = np.arange(count) / self.sample_rate
+            pip = (0.2 * np.sin(2 * np.pi * 330 * t)).astype(np.float32)
+            mono = np.concatenate(
+                (pip, np.zeros(int(self.sample_rate * gap_s), np.float32), pip)
+            )
+
+            return np.column_stack((mono, mono))
+
+    # ======================================================
     # PLAY URGENT WARNING
     # ======================================================
 
@@ -953,6 +1036,46 @@ class HRTFRenderer:
         return True
 
     # ======================================================
+    # PLAY MEMORY EARLY WARNING
+    # ======================================================
+
+    def play_memory_cue(
+        self,
+        azimuth_deg=0.0,
+        distance_m=4.0,
+        force=False,
+    ):
+        """Queue a memory cue from a remembered hazard's direction.
+
+        azimuth_deg uses the PROJECT physical convention. Lowest
+        priority: never displaces an urgent or path cue.
+
+        Never blocks: returns True if the cue was queued, False if it
+        was skipped (cooldown) or dropped (queue full).
+        """
+
+        now = time.monotonic()
+
+        if (
+            not force
+            and (
+                now
+                - self.last_memory_cue_time
+            )
+            < self.memory_cue_cooldown
+        ):
+            return False
+
+        if not self._enqueue(
+            _Cue(MEMORY, float(azimuth_deg), distance_m=float(distance_m))
+        ):
+            return False
+
+        self.last_memory_cue_time = now
+
+        return True
+
+    # ======================================================
     # QUEUE + WORKER
     # ======================================================
 
@@ -966,17 +1089,17 @@ class HRTFRenderer:
                 return False
 
             if cue.kind == URGENT:
-                # Urgent pre-empts: drop queued soft cues ...
+                # Urgent pre-empts: drop queued soft/memory cues ...
                 self._queue = deque(
                     queued
                     for queued in self._queue
                     if queued.kind == URGENT
                 )
 
-                # ... and cut off a soft cue that is playing now.
+                # ... and cut off a soft/memory cue that is playing now.
                 if (
                     self._playing is not None
-                    and self._playing.kind == SOFT
+                    and self._playing.kind != URGENT
                 ):
                     self._playing.cancelled = True
                     interrupt = True
@@ -985,9 +1108,17 @@ class HRTFRenderer:
                 while len(self._queue) >= self.max_queue:
                     self._queue.popleft()
 
-            else:
+            elif cue.kind == SOFT:
                 if len(self._queue) >= self.max_queue:
-                    oldest_soft = next(
+                    # Make room: oldest memory cue first, then oldest soft.
+                    victim = next(
+                        (
+                            queued
+                            for queued in self._queue
+                            if queued.kind == MEMORY
+                        ),
+                        None,
+                    ) or next(
                         (
                             queued
                             for queued in self._queue
@@ -996,11 +1127,16 @@ class HRTFRenderer:
                         None,
                     )
 
-                    if oldest_soft is None:
+                    if victim is None:
                         # Queue holds only urgent cues.
                         return False
 
-                    self._queue.remove(oldest_soft)
+                    self._queue.remove(victim)
+
+            else:
+                # Memory cue: lowest priority, never displaces anything.
+                if len(self._queue) >= self.max_queue:
+                    return False
 
             self._queue.append(cue)
             self._lock.notify()
@@ -1041,8 +1177,10 @@ class HRTFRenderer:
                     # did when playback was blocking.
                     if cue.kind == URGENT:
                         self.last_warning_time = finished
-                    else:
+                    elif cue.kind == SOFT:
                         self.last_path_guidance_time = finished
+                    else:
+                        self.last_memory_cue_time = finished
 
     def _play_cue(self, cue: _Cue):
         if cue.kind == URGENT:
@@ -1057,7 +1195,7 @@ class HRTFRenderer:
                 f"{cue.azimuth_deg:+.1f}°"
             )
 
-        else:
+        elif cue.kind == SOFT:
             audio = self.create_path_guidance_sound(
                 cue.azimuth_deg,
                 0.45,
@@ -1067,6 +1205,18 @@ class HRTFRenderer:
                 "Playing SOFT path-guidance "
                 "cue toward physical "
                 f"{cue.azimuth_deg:+.1f}°"
+            )
+
+        else:
+            audio = self.create_memory_cue_sound(
+                cue.azimuth_deg,
+                cue.distance_m,
+            )
+
+            label = (
+                "Playing MEMORY cue (remembered hazard) "
+                f"at physical {cue.azimuth_deg:+.1f}°, "
+                f"{cue.distance_m:.1f} m"
             )
 
         if cue.cancelled:

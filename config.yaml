@@ -153,6 +153,19 @@ memory_reasoning:
   forget_after_misses: 4
   forget_belief: 0.2
   hit_gain: 0.3
+  # Memory early warning (sonified top-k acoustic attention): a remembered
+  # static hazard the camera does not see now, cue_min_m..cue_max_m ahead,
+  # within cue_max_bearing_deg, with decay_weight x belief >= cue_min_trust,
+  # ranked by `attention`; one cue per frame at most, cooldowns per hazard
+  # and global. Urgent / path-guidance cues in the same frame suppress it.
+  cue_min_m: 2.5
+  cue_max_m: 8.0
+  cue_max_bearing_deg: 40.0
+  cue_min_trust: 0.3
+  cue_cooldown_s: 8.0
+  cue_global_cooldown_s: 2.0
+  cue_skip_seen_within_s: 1.0  # seen this recently = still in view (a dropout, not a memory)
+  cue_display_s: 3.0           # status-panel "Memory cue:" line stays this long
 
 # ------------------------------------------------------------------
 # Acoustic attention (navigation/reasoning.py)
@@ -169,6 +182,7 @@ audio:
   device: null                 # index or name fragment; null = automatic
   warning_cooldown_s: 0.8      # urgent cues
   path_guidance_cooldown_s: 1.0
+  memory_cue_cooldown_s: 2.0   # memory early-warning cues (lowest priority)
   max_queue: 2
   # Names containing these are Bluetooth (100-250 ms extra latency, used last).
   bluetooth_keywords: [bluetooth, hands-free, handsfree, a2dp, airpods, buds, enco]

@@ -67,6 +67,7 @@ from navigation.hrtf_renderer import HRTFRenderer
 from navigation.memory import RouteMemory, SessionClock
 from navigation.memory_reasoning import (
     CameraModel,
+    MemoryEarlyWarning,
     MemoryReasoningConfig,
     NegativeEvidenceState,
     pose_is_trusted,
@@ -123,8 +124,12 @@ def draw_status(
     path_decision,
     audio_enabled: bool,
     pose_mode: str = "sim",
+    memory_line: str | None = None,
 ) -> None:
-    """Draw a compact navigation status panel on the frame."""
+    """Draw a compact navigation status panel on the frame.
+
+    memory_line: "Memory cue: ..." while a memory early-warning cue is recent.
+    """
     image_height, image_width = image.shape[:2]
     panel_height = min(330, image_height)
 
@@ -184,6 +189,9 @@ def draw_status(
         )
         lines.append(f"Memory top-k: {labels}")
 
+    if memory_line:
+        lines.append(memory_line)
+
     if not path_decision.current_path_safe:
         blockers = ", ".join(
             path_decision.blocking_hazards[:2]
@@ -200,6 +208,8 @@ def draw_status(
             colour = (0, 0, 255)
         elif line.startswith("PATH: SAFE"):
             colour = (0, 180, 0)
+        elif line.startswith("Memory cue"):
+            colour = (0, 200, 255)  # amber, as the mini-map ring
         else:
             colour = (255, 255, 255)
 
@@ -504,6 +514,7 @@ def main() -> None:
                 max_queue=int(audio_cfg["max_queue"]),
                 bluetooth_keywords=audio_cfg["bluetooth_keywords"],
                 headphone_keywords=audio_cfg["headphone_keywords"],
+                memory_cue_cooldown=float(audio_cfg["memory_cue_cooldown_s"]),
             )
         except RuntimeError as error:
             frame_source.close()
@@ -511,6 +522,17 @@ def main() -> None:
         print("HRTF spatial audio initialized.\n")
     else:
         print("HRTF spatial audio disabled.\n")
+
+    # Memory early warning: sonified top-k attention over remembered,
+    # currently unseen hazards (navigation/memory_reasoning.py).
+    early_warning = MemoryEarlyWarning(
+        reasoning_cfg,
+        attention,
+        session_id=session_id,
+        dynamic_labels=memory.dynamic_labels,
+        match_radius_m=memory.match_radius_m,
+        renderer=hrtf_renderer,
+    )
 
     phone_pose: PhonePose | None = None
 
@@ -599,6 +621,10 @@ def main() -> None:
         print(
             f"Cleared persistent memory: {db_path.resolve()}"
         )
+    # Recorded video: this run's memory clock starts after everything
+    # already remembered (an earlier run may have replayed faster than
+    # real time).
+    memory_clock.start_after(memory.latest_timestamp())
 
     frame_id = 0
     warning_frames = 0
@@ -830,6 +856,8 @@ def main() -> None:
 
             warnings = []
             audio_played_this_frame = False
+            # A path-guidance cue is due this frame (audio on or not).
+            path_cue_due = False
 
             # -------------------------------------------------
             # Hazard classification + urgent audio
@@ -894,6 +922,11 @@ def main() -> None:
                 useful_directional_guidance = (
                     path_decision.selected_path != "ahead"
                 )
+                path_cue_due = (
+                    blocking_detection is not None
+                    and useful_directional_guidance
+                    and path_decision.guidance_changed
+                )
 
                 if (
                     hrtf_renderer is not None
@@ -934,6 +967,25 @@ def main() -> None:
                 print(f"PATH UNSAFE | {path_decision.reason}")
 
             # -------------------------------------------------
+            # Memory early warning (lowest audio priority)
+            # -------------------------------------------------
+            # A remembered static hazard ahead that the camera does not
+            # see now gets a soft "remembered hazard" cue. An urgent or
+            # path cue this frame suppresses it; it never touches the
+            # planner. Earlier cues are confirmed when the camera sees
+            # the hazard (lead time).
+            early_warning.update(
+                remembered,
+                pose,
+                detections,
+                seen_hazard_ids if pose.valid else set(),
+                memory_time,
+                pose_trusted=pose_trusted,
+                suppressed=bool(warnings) or path_cue_due,
+            )
+            memory_line = early_warning.display_text(memory_time)
+
+            # -------------------------------------------------
             # Persistent-memory attention
             # -------------------------------------------------
             top_hazards = attention.rank(
@@ -961,6 +1013,7 @@ def main() -> None:
                 path_decision,
                 audio_enabled=hrtf_renderer is not None,
                 pose_mode=pose_mode,
+                memory_line=memory_line,
             )
 
             if not args.no_lanes:
@@ -1007,6 +1060,11 @@ def main() -> None:
                 lanes=[] if args.no_lanes else lanes_for_minimap(path_decision),
                 lane_width_m=float(config["planner"]["path_width_m"]),
                 lane_length_m=float(config["planner"]["horizon_m"]),
+                highlight=(
+                    (early_warning.last_cue.world_x, early_warning.last_cue.world_y)
+                    if memory_line and early_warning.last_cue is not None
+                    else None
+                ),
             )
 
             writer.write(display)
@@ -1191,6 +1249,13 @@ def main() -> None:
         ),
         "path_events": path_events,
         "warning_events": warning_events,
+        "memory_cues": [
+            record.as_dict(memory_clock.run_start_epoch)
+            for record in early_warning.cue_log.records
+        ],
+        "memory_summary": early_warning.cue_log.summary(
+            hazards_forgotten=len(negative_state.forgotten)
+        ),
         "negative_evidence": {
             "misses_recorded": negative_state.misses_recorded,
             "hazards_forgotten": len(negative_state.forgotten),
@@ -1236,6 +1301,12 @@ def main() -> None:
                 "Non-immediate path blockage with a useful alternative; "
                 "HRTF direction represents the recommended walking direction."
             ),
+            "memory_early_warning": (
+                "Remembered static hazard ahead that the camera does not see "
+                "now; two soft low pips from the hazard's direction; lowest "
+                "priority (suppressed by urgent/path cues), never used by the "
+                "planner."
+            ),
             "silent": (
                 "Distant/non-actionable objects do not produce audio."
             ),
@@ -1277,6 +1348,14 @@ def main() -> None:
     print(f"HRTF warnings played: {audio_warning_count}")
     print(f"Path-unsafe frames: {path_unsafe_frames}")
     print(f"Path guidance HRTF warnings played: {path_warning_audio_count}")
+    memory_summary = report["memory_summary"]
+    print(
+        f"Memory cues: {memory_summary['cues_played']} "
+        f"(later confirmed by the camera: {memory_summary['cues_later_confirmed']}, "
+        f"mean lead {memory_summary['mean_lead_time_s']} s / "
+        f"{memory_summary['mean_lead_distance_m']} m)"
+    )
+    print(f"Hazards forgotten by negative evidence: {len(negative_state.forgotten)}")
     print(f"Average FPS: {report['average_fps']}")
     print(f"Annotated video: {output_path.resolve()}")
     print(f"JSON report: {report_path.resolve()}")

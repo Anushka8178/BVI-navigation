@@ -11,6 +11,14 @@ from numpy.typing import NDArray
 ImageArray = NDArray[np.uint8]
 
 
+def expand_audio_azimuth(azimuth_deg: float) -> float:
+    """Perceptually expanded PHYSICAL azimuth for HRTF cues (x2.5, +-90).
+
+    Same convention in and out: negative = left, 0 = ahead, positive = right.
+    """
+    return max(-90.0, min(90.0, azimuth_deg * 2.5))
+
+
 class Motion(str, Enum):
     STATIC = "static"
     APPROACHING = "approaching"
@@ -72,15 +80,7 @@ class Detection:
         branches from using different coordinate conventions.
         """
 
-        expanded = self.azimuth_deg * 2.5
-
-        return max(
-            -90.0,
-            min(
-                90.0,
-                expanded,
-            ),
-        )
+        return expand_audio_azimuth(self.azimuth_deg)
 
 
 @dataclass(frozen=True)

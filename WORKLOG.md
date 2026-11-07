@@ -139,3 +139,72 @@ Smoke run: `video_navigation_demo_slam_memory.py --source videos\street1.mp4 --n
 --no-esp32 --no-display` (temp db) processed 141 frames at 15 FPS on CPU with no errors.
 
 Result: `python -m pytest -q` gives **177 passed**.
+
+## Task 4: memory early warning (sonified top-k acoustic attention)
+
+What changed
+- `navigation/memory_reasoning.py`
+  - `select_memory_cues(...)`. Candidates: remembered non-dynamic hazards not matched by
+    this frame's detections, with a trusted pose, forward distance in [2.5, 8] m,
+    |bearing| <= 40 deg and decay x belief >= 0.3. They are ranked by the existing
+    `AcousticAttention` (top-k from config, on copies so priorities are not overwritten). The best
+    one not on its 8 s cooldown wins, with a 2 s global cooldown and at most one cue per frame.
+    `suppressed=True` (urgent or path cue due) returns nothing and books no cooldown.
+  - `MemoryCue` (+ `describe()`: `pothole ahead-left 4.2 m | seen in 2 earlier walks, last
+    2 days ago`), `direction_words`, `format_age`, `CueState`.
+  - `CueLog`: lead time = first later frame in which the cued hazard_id is seen minus
+    cue time; lead distance = distance at cue time; `summary()` for the report.
+  - `MemoryEarlyWarning`: confirm, select, play (renderer optional), log, plus status-panel text.
+    The demo and the eval tool both use it.
+- `navigation/hrtf_renderer.py`: `play_memory_cue(azimuth_deg, distance_m)`, a new `MEMORY` kind.
+  Two soft low pips (330 + 495 Hz, 90 ms each, 80 ms gap), level 0.32 to 0.22 by distance
+  (path 0.50, urgent 0.85). Own cooldown `audio.memory_cue_cooldown_s: 2.0`. Lowest priority:
+  urgent drops queued memory cues and interrupts a playing one; a path cue on a full queue
+  replaces a memory cue first; a memory cue on a full queue is dropped. The physical to SOFA
+  conversion stays in `_spatialize`.
+- `navigation/models.py`: `expand_audio_azimuth()` (x2.5, +-90) shared by detections and memory cues.
+- `navigation/minimap.py`: `highlight=(x, y)` draws an amber ring on the cued hazard.
+- Demo: after urgent + path guidance, `early_warning.update(...)` with
+  `suppressed = urgent warnings this frame or a path cue due` (computed whether audio is on
+  or not). The planner is untouched. Status panel `Memory cue: ...` (amber, 3 s), mini-map ring,
+  console `MEMORY CUE | ...`. JSON: `memory_cues` list + `memory_summary` (cues played, with
+  audio, later confirmed, mean lead time/distance, hazards forgotten by negative evidence),
+  plus a `memory_early_warning` entry in `audio_policy`. End-of-run console summary.
+- `scripts/manual/test_memory_cue.py` (left/ahead/right + path/urgent for comparison), listed
+  in `scripts/manual/README.md`.
+- Robustness found while testing two walks back to back:
+  - `RouteMemory._match_hazard`: the "already updated this frame" skip only applies to
+    rows from this session. Before, a later-stamped row from an earlier run could block matching.
+  - `SessionClock.start_after(memory.latest_timestamp())`: a recorded-video run's memory clock
+    starts after everything already in memory, in case the earlier run replayed faster than
+    real time (possible on the GPU).
+
+Decisions
+- **Added `cue_skip_seen_within_s: 1.0`** (config). A hazard the camera saw less than 1 s ago is
+  still "in view" (a one-frame detector dropout), so it does not count as a remembered unseen
+  hazard. Without this, the cue would fire on every dropout of a visible pothole. Chosen once
+  for UX, before running any evaluation.
+- "Earlier walks" = `sessions_seen` minus 1 if the hazard was also seen in this session.
+- Memory-cue audio azimuth uses the same perceptual expansion as urgent cues (x2.5, clamp +-90),
+  since both point at the hazard.
+- Suppression uses "urgent warnings exist this frame" (even if the urgent sound is on
+  cooldown) or "a path cue is due" (blocked lane, useful lateral escape, guidance changed).
+
+Tests added
+- `tests/test_memory_cues.py` (fake renderer): a pothole 5 m ahead, unseen, remembered from a
+  walk 2 days ago gets a cue (exact console line); a currently detected one (by id or nearby same
+  label) does not; behind / > 40 deg / too far / too close do not; facing away vs turning
+  toward it; per-hazard and global cooldowns; suppression books no cooldown; untrusted pose and
+  low trust; a one-frame dropout is not a memory; a dynamic hazard; "seen earlier in this walk";
+  lead time 1.5 s / 5.0 m and the summary dict; formatting helpers; config.
+- `tests/test_hrtf_audio.py`: memory cue played; urgent drops and interrupts memory; a memory cue
+  cannot displace path or urgent cues; a path cue replaces a queued memory cue; memory cooldown;
+  the memory sound is quieter than path guidance, louder on the left for -60 deg, two pips with a gap.
+- `tests/test_memory.py`: `start_after`; matching across sessions with a clock that runs behind.
+
+Two-walk smoke run (same video twice, same DB, `--pose sim`, no audio): walk 2 printed
+`MEMORY CUE | pole ahead-right 3.4 m | seen in 1 earlier walk, last 7 s ago`. The report blocks
+were filled. Memory doubled (10 to 20 rows) because `--pose sim` does not follow the video,
+so a pole's world position drifts as the camera approaches. This is known bug #1 (use slam/phone).
+
+Result: `python -m pytest -q` gives **202 passed**.

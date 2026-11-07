@@ -314,6 +314,36 @@ class TestSessionClock(unittest.TestCase):
         rerun = SessionClock(live=False, run_start_epoch=1_750_000_600.0)
         self.assertGreater(rerun.stamp(0.0), stamps[-1])
 
+    def test_recorded_run_starts_after_newest_remembered_time(self) -> None:
+        # Walk 1 replayed faster than real time: its memory times run ahead.
+        clock = SessionClock(live=False, run_start_epoch=1_750_000_000.0)
+        clock.start_after(1_750_000_100.0)
+        self.assertEqual(clock.stamp(0.0), 1_750_000_101.0)
+        clock.start_after(1_700_000_000.0)  # older: no change
+        self.assertEqual(clock.run_start_epoch, 1_750_000_101.0)
+        live = SessionClock(live=True, wall=FakeClock(5.0))
+        live.start_after(1e12)  # live always uses the wall clock
+        self.assertEqual(live.stamp(0.0), 5.0)
+
+    def test_other_session_with_later_clock_still_matches(self) -> None:
+        handle, db_path = tempfile.mkstemp(suffix=".db")
+        os.close(handle)
+        os.remove(db_path)
+        try:
+            walk1 = RouteMemory(db_path, decay_half_life_s=1e9, session_id="w1",
+                                now_fn=FakeClock(2_000.0))
+            first = walk1.remember("pole-1", "pole", 0.0, 5.0, 0.9, timestamp=2_000.0)
+            self.assertEqual(walk1.latest_timestamp(), 2_000.0)
+            # Walk 2's clock is behind walk 1's last sighting.
+            walk2 = RouteMemory(db_path, decay_half_life_s=1e9, session_id="w2",
+                                now_fn=FakeClock(1_990.0))
+            second = walk2.remember("pole-3", "pole", 0.1, 5.0, 0.9, timestamp=1_990.0)
+            self.assertEqual(second.hazard_id, first.hazard_id)
+            self.assertEqual(second.sessions_seen, 2)
+        finally:
+            if os.path.exists(db_path):
+                os.remove(db_path)
+
     def test_default_start_is_wall_clock_and_live_uses_wall_clock(self) -> None:
         wall = FakeClock(1_760_000_000.0)
         recorded = SessionClock(live=False, wall=wall)
