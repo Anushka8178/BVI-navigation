@@ -39,6 +39,22 @@ esp32:
   reconnect_delay_s: 1.0     # wait between attempts to open the port
 
 # ------------------------------------------------------------------
+# Ultrasonic + camera fusion (navigation/range_fusion.py), used when the
+# ESP32 range sensor is running (not with --no-esp32). The nearest
+# detection within +-cone_deg of straight ahead takes the measured
+# distance if the reading is min_m..max_m and agrees with the camera's
+# estimate within a factor agree_ratio. An unexplained reading below
+# unknown_obstacle_m adds a synthetic "unknown_obstacle" straight ahead
+# (walls, glass, things YOLO misses); it is never stored in memory.
+# ------------------------------------------------------------------
+range_fusion:
+  cone_deg: 7.5              # HC-SR04 ~15 deg cone
+  min_m: 0.2
+  max_m: 4.0
+  unknown_obstacle_m: 1.2
+  agree_ratio: 2.0
+
+# ------------------------------------------------------------------
 # Pose (navigation/sensing.py PhonePose; SensorServer app on the phone,
 # ws://<network.phone_ip>:<network.sensor_port>)
 # ------------------------------------------------------------------

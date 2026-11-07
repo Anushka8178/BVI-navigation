@@ -22,6 +22,7 @@ REQUIRED_SECTIONS = (
     "camera",
     "network",
     "esp32",
+    "range_fusion",
     "pose",
     "perception",
     "hazard",

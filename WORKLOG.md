@@ -268,3 +268,37 @@ Tests (`tests/test_eval_memory.py`): a tiny scenario (8 m loop, 5 Hz, 2 walks) r
 variant A never cues (B never cues; only D forgets); same seed gives the same result; B remembers
 nothing 2 days later while C still remembers the permanent hazards; route/world geometry;
 pooling over runs. `tests/test_memory_cues.py`: an unconfirmed one-frame hazard is not cued.
+
+## Task 5: ESP32 ultrasonic fusion (hardware arrives later; ready and tested)
+
+What changed
+- New `navigation/range_fusion.py` (pure): `RangeFusionConfig.from_config()` (rejects unknown keys),
+  `fuse_range(detections, range_m, cfg) -> FusionResult`, `with_distance()` (rescales
+  relative x/y along the bearing with `dataclasses.replace`).
+  - Distance fix: the nearest detection within +-`cone_deg` (7.5) of straight ahead takes the
+    ultrasonic distance when the reading is in [`min_m` 0.2, `max_m` 4.0].
+  - Unknown obstacle: a reading below `unknown_obstacle_m` (1.2) that no detection in the cone
+    explains adds `Detection(label="unknown_obstacle", relative_x=0, relative_y=value,
+    confidence=1.0)`. The hazard classifier rates it urgent; the planner sees it.
+  - No reading (`None`: stale, no echo, sensor missing) changes nothing.
+- `config.yaml` `range_fusion:` (required section). Demo: fusion right after perception when
+  the range sensor runs; `unknown_obstacle` is remembered with `persist=False` (never stored);
+  JSON report block `range_fusion` (frames with a reading, distances replaced, unknown-obstacle
+  frames). `--no-esp32`: no sensor, so nothing changes.
+
+Decision
+- **Agreement gate `agree_ratio: 2.0`** (not in the task). The distance is replaced only if the
+  camera's monocular estimate is within a factor 2 of the reading. Example: camera says a pole at 6 m,
+  ultrasonic says 1.0 m. That is almost certainly something else in front (glass door, wall).
+  Dragging the pole to 1 m would be wrong; instead the close reading becomes an `unknown_obstacle`
+  (urgent) and the pole stays at 6 m. So "no detection ahead" in the task is read as "no
+  detection ahead that agrees with the reading".
+
+Tests (`tests/test_range_fusion.py`, 10): no reading -> unchanged; the nearest in-cone detection
+gets the distance and keeps its bearing, others untouched; readings outside [0.2, 4] m don't
+replace; a close reading with nothing ahead adds an urgent unknown obstacle; a far reading with
+nothing ahead adds nothing; a disagreeing reading adds an obstacle and leaves the detection; an
+agreeing close reading corrects instead of adding; config section.
+
+Not tested on hardware (sensor not here yet): run `scripts/manual/check_esp32.py`, then a live
+run without `--no-esp32` and check `range_fusion` in the JSON report.

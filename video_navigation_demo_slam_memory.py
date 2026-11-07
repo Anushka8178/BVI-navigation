@@ -77,6 +77,7 @@ from navigation.minimap import draw_minimap
 from navigation.path_overlay import draw_lanes, lanes_for_minimap
 from navigation.models import FramePacket, Pose
 from navigation.planner import LocalPathPlanner
+from navigation.range_fusion import UNKNOWN_OBSTACLE, RangeFusionConfig, fuse_range
 from navigation.range_sensor import RangeSensor
 from navigation.reasoning import AcousticAttention
 from navigation.sensing import PhonePose, localize_detection, simulated_pose
@@ -605,9 +606,17 @@ def main() -> None:
     trajectory_rows: list[tuple[float, float, float, float, int, str]] = []
     trajectory_xy: list[tuple[float, float]] = []
 
-    # Range sensor: started and stopped only for now (fusion comes later).
-    # A missing port prints one warning; the run continues without it.
+    # Range sensor: fused with the detections every frame
+    # (navigation/range_fusion.py). A missing port prints one warning; the
+    # run continues without it (latest_m() is None, nothing changes).
     range_sensor: RangeSensor | None = None
+    try:
+        fusion_cfg = RangeFusionConfig.from_config(config["range_fusion"])
+    except (TypeError, ValueError) as error:
+        raise SystemExit(f"Config error: {error}") from error
+    range_frames = 0
+    range_corrections = 0
+    unknown_obstacle_frames = 0
 
     if not args.no_esp32:
         range_sensor = RangeSensor.from_config(config["esp32"])
@@ -704,6 +713,16 @@ def main() -> None:
 
             detections = perception.process(frame_packet)
 
+            # Ultrasonic fusion: measured distance for the detection straight
+            # ahead, or an "unknown_obstacle" YOLO did not see.
+            if range_sensor is not None:
+                fusion = fuse_range(detections, range_sensor.latest_m(), fusion_cfg)
+                detections = fusion.detections
+                if fusion.range_m is not None:
+                    range_frames += 1
+                range_corrections += fusion.corrected_id is not None
+                unknown_obstacle_frames += fusion.added_unknown
+
             if pose_mode == "slam":
                 if slam is None:
                     frame_h, frame_w = image.shape[:2]
@@ -796,7 +815,8 @@ def main() -> None:
                     velocity_x=track.velocity_x,
                     velocity_y=track.velocity_y,
                     # Invalid pose: world position unknown, don't store it.
-                    persist=pose.valid,
+                    # An ultrasonic-only obstacle has no identity to remember.
+                    persist=pose.valid and detection.label != UNKNOWN_OBSTACLE,
                     anchor=(
                         None
                         if anchor_kf is None
@@ -1249,6 +1269,12 @@ def main() -> None:
         ),
         "path_events": path_events,
         "warning_events": warning_events,
+        "range_fusion": {
+            "enabled": range_sensor is not None,
+            "frames_with_reading": range_frames,
+            "detection_distances_replaced": range_corrections,
+            "unknown_obstacle_frames": unknown_obstacle_frames,
+        },
         "memory_cues": [
             record.as_dict(memory_clock.run_start_epoch)
             for record in early_warning.cue_log.records
