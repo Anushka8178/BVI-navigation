@@ -1,0 +1,3080 @@
+From 0b1486fa9b307f98de15259d9a5f2d92ad21927f Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 7 Nov 2026 20:27:21 +0000
+Subject: [PATCH] Add lightweight visual SLAM (--pose slam) with loop closure,
+ saved map and relocalization
+
+- navigation/vslam.py: keyframe monocular VO (ORB, essential matrix, dynamic YOLO
+  boxes masked), scale from phone steps, heading fused with phone, loop closure
+  (triangulation + PnP, 2D pose graph via SciPy, consistency check), map save/load
+  and relocalization into the same world frame across runs
+- RouteMemory: keyframe anchors + reanchor() so hazards follow loop-closure corrections
+- Demo: --pose slam, --slam-map, --slam-new-map, --no-phone, --trajectory-out, mini-map
+- Tools: simulate_slam_walk, eval_walk_drift, eval_slam_tum; camera calibration script
+- Tests: 21 hardware-free tests on synthetic rendered frames
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Dny5kVZY2eF9qMXcWj7JDL
+---
+ .gitignore                           |    4 +
+ CLAUDE.md                            |   13 +-
+ README.md                            |   82 +-
+ config.yaml                          |   58 ++
+ navigation/memory.py                 |   73 +-
+ navigation/minimap.py                |   95 +++
+ navigation/slam_eval.py              |   92 +++
+ navigation/synthetic_scene.py        |  203 +++++
+ navigation/vslam.py                  | 1074 ++++++++++++++++++++++++++
+ scripts/manual/calibrate_camera.py   |  106 +++
+ tests/test_vslam.py                  |  342 ++++++++
+ tools/eval_slam_tum.py               |  169 ++++
+ tools/eval_walk_drift.py             |   76 ++
+ tools/simulate_slam_walk.py          |   90 +++
+ video_navigation_demo_slam_memory.py |  255 +++++-
+ 15 files changed, 2706 insertions(+), 26 deletions(-)
+ create mode 100644 navigation/minimap.py
+ create mode 100644 navigation/slam_eval.py
+ create mode 100644 navigation/synthetic_scene.py
+ create mode 100644 navigation/vslam.py
+ create mode 100644 scripts/manual/calibrate_camera.py
+ create mode 100644 tests/test_vslam.py
+ create mode 100644 tools/eval_slam_tum.py
+ create mode 100644 tools/eval_walk_drift.py
+ create mode 100644 tools/simulate_slam_walk.py
+
+diff --git a/.gitignore b/.gitignore
+index 64321e9..080d38d 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -50,3 +50,7 @@ videos/*_navigation*.json
+ videos/*_annotated*.json
+ /output*.json
+ evaluation_*.json
++
++# Visual SLAM maps and trajectories (generated per walk)
++*.npz
++trajectory*.csv
+diff --git a/CLAUDE.md b/CLAUDE.md
+index b89cfc6..3748d0b 100644
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -42,7 +42,15 @@ big refactors. Do not add heavy new dependencies. Do not rewrite modules that al
+     physical→SOFA azimuth conversion, with path guidance played at the *walking* direction.
+ - Main entry point: `video_navigation_demo_slam_memory.py`.
+ - Modules: `navigation/` (models, yolo_perception, hazard, sensing, memory, planner, trajectory,
+-  reasoning, audio, hrtf_renderer). HRTF file: `hrtf/mit_kemar_normal_pinna.sofa`.
++  reasoning, audio, hrtf_renderer, vslam, minimap, slam_eval, synthetic_scene).
++  HRTF file: `hrtf/mit_kemar_normal_pinna.sofa`.
++- **Visual SLAM** (`--pose slam`, `navigation/vslam.py`, config `slam:`): keyframe monocular VO
++  (ORB + essential matrix, dynamic YOLO boxes masked), scale from phone steps (or
++  `slam.assumed_speed_m_s`), heading fused with the phone, loop closure (triangulation + PnP,
++  2D pose graph with SciPy, consistency check), saved map `slam_map.npz` + relocalization so
++  later runs share the world frame. Hazards store a keyframe anchor (`anchor`, `anchor_right`,
++  `anchor_forward` columns) and `RouteMemory.reanchor()` moves them after loop closure.
++  `navigation/synthetic_scene.py` renders a textured room for hardware-free SLAM tests.
+ - Detector: custom YOLO26 `best.pt`, 23 classes: stop_sign, person, bicycle, bus, truck, car,
+   motorbike, reflective_cone, ashcan, warning_column, spherical_roadblock, pole, dog, tricycle,
+   fire_hydrant, pothole, stairs, curb, drain, tree, autorickshaw, animal, barrier.
+@@ -51,7 +59,8 @@ big refactors. Do not add heavy new dependencies. Do not rewrite modules that al
+   Needs `ultralytics>=8.4`.
+ 
+ ## Known bugs to fix (verified in the code)
+-1. **Pose doesn't follow the video:** `simulated_pose(t)` invents motion. Replace it with `PhonePose`.
++1. **Pose doesn't follow the video:** `simulated_pose(t)` invents motion. Fixed: use `--pose phone`
++   (dead reckoning) or `--pose slam` (visual SLAM).
+ 2. **Heading convention mismatch:** `AcousticAttention` uses forward = (sin h, cos h), i.e. heading
+    clockwise from +y, but `local_to_world` rotates counter-clockwise, and `simulated_pose` walks along +x
+    at heading 0.
+diff --git a/README.md b/README.md
+index f84bdea..d4008b6 100644
+--- a/README.md
++++ b/README.md
+@@ -169,6 +169,81 @@ reasoning) can be built and demonstrated against a stable interface before
+ a real SLAM system (RealSense RGB-D + IMU → RTAB-Map/ORB-SLAM3 → `Pose`)
+ is dropped in — see `navigation/sensing.py`'s own docstring.
+ 
++## Visual SLAM (`--pose slam`)
++
++`navigation/vslam.py` is a **real, lightweight keyframe monocular visual SLAM**
++that runs on the laptop (OpenCV + NumPy + SciPy only, no phone app, no ROS).
++It replaces the simulated pose and improves on phone dead reckoning, behind the
++same `Pose` interface, so hazard triage, planner, memory, attention and HRTF are
++unchanged.
++
++| Part | What it does |
++| --- | --- |
++| Tracking | ORB features (grid-spread) matched to the current keyframe; essential matrix (RANSAC) gives rotation + translation direction. Features on dynamic YOLO boxes (people, vehicles, animals) are masked out. |
++| Scale | Metric distance from the phone's step counter (steps x `pose.stride_m`); camera-only runs use `slam.assumed_speed_m_s`. |
++| Heading | Visual yaw, pulled gently towards the phone's rotation-vector heading at each keyframe. |
++| Map | Keyframes: pose + ORB features + a thumbnail for place recognition. |
++| Loop closure | A revisited place is recognized, its metric relative pose measured (triangulation + PnP), and a 2D pose graph is optimized (SciPy least squares). A loop that would tear the odometry apart is rejected. |
++| Hazard re-anchoring | Each remembered hazard stores the keyframe it was seen from; when loop closure moves keyframes, `RouteMemory.reanchor()` moves the hazards too. |
++| Saved map + relocalization | The map is saved to `slam.map_path` (`slam_map.npz`). The next run recognizes where it is in that map and continues in **the same world frame**, so hazards in persistent memory line up across walks. Memory writing is paused until then. |
++| Tracking loss | Falls back to phone dead reckoning (if connected) while trying to re-find a keyframe; without the phone the pose is invalid (alerts continue, memory pauses). |
++
++Run it:
++
++```powershell
++# Live (IP Webcam + SensorServer). First run builds the map; later runs reuse it.
++python video_navigation_demo_slam_memory.py --pose slam --trajectory-out runs\walk.csv
++
++# Start fresh (new map + empty memory)
++python video_navigation_demo_slam_memory.py --pose slam --slam-new-map --reset
++
++# Recorded video, camera only
++python video_navigation_demo_slam_memory.py --source videos\walk.mp4 --pose slam --no-phone --slam-new-map --reset
++```
++
++The annotated video has a mini-map (bottom right): keyframe path, loop-closure
++links, remembered hazards and the SLAM state (TRACKING / RELOCALIZING / LOST).
++The JSON report has a `slam` block (keyframes, loop closures, relocalizations,
++hazards moved, events, ms per frame).
++
++For relocalization to work, **start each walk where an earlier walk passed**,
++ideally at the same taped start mark facing the same way.
++
++Calibrate the camera once (better accuracy than the `slam.hfov_deg` guess):
++`python scripts/manual/calibrate_camera.py --source http://<PHONE_IP>:8080/video`,
++then paste the printed `fx, fy, cx, cy, calib_width` into `config.yaml`.
++
++Evaluation tools:
++
++```powershell
++# Simulation: SLAM vs phone dead reckoning on a known square path (no hardware)
++python tools/simulate_slam_walk.py --laps 2 --video runs\sim_slam.mp4
++
++# Our own walks: drift of a closed loop for each pose source
++python tools/eval_walk_drift.py runs\loop_phone.csv runs\loop_slam.csv --png runs\loop.png
++
++# TUM RGB-D benchmark (planar pioneer sequences fit the 2D model best)
++python tools/eval_slam_tum.py C:\data\rgbd_dataset_freiburg2_pioneer_slam --camera fr2 --out runs\tum
++```
++
++Simulation result (`tools/simulate_slam_walk.py --laps 2`: 64 m, 7 % stride
++error, phone heading drift 0.3 deg/s): end-point error 0.13 m with SLAM vs
++1.58 m with phone dead reckoning (drift 0.2 % vs 2.5 %), 31 loop closures.
++
++SLAM limitations (state them honestly):
++
++- Monocular, 2D ground-plane pose (x, y, heading); assumes roughly flat ground.
++  No bundle adjustment or 3D map, so it is far simpler than ORB-SLAM3.
++- Metric scale is only as good as the step length (`pose.stride_m`) or the
++  assumed speed; loop closure cannot fix a wrong stride.
++- A pure sideways step in front of distant surfaces looks like a small turn
++  to one camera; the walking-forward assumption covers normal walking.
++- Relocalization works best within a few metres of where an earlier walk
++  passed, facing a similar direction.
++- Low texture (blank walls), low light, motion blur and very fast turns can
++  lose tracking.
++- Not yet evaluated on TUM / EuRoC or real campus walks: run the tools above.
++
+ ## Verifying persistent memory with SQL
+ 
+ `video_navigation_demo_slam_memory.py` writes to `navigation_memory.db`, a
+@@ -235,9 +310,10 @@ python -c "import sqlite3; c = sqlite3.connect('navigation_memory.db'); c.row_fa
+ - Positions are already expressed as relative 3D coordinates; no calibrated depth reconstruction is performed.
+ - Audio is represented as structured console events, not true HRTF waveforms.
+ - Route planning compares two predefined route candidates rather than a full semantic map.
+-- `video_navigation_demo_slam_memory.py`'s pose comes from a deterministic
+-  simulated trajectory (`simulated_pose()` / `navigation/sensing.py`), not
+-  real camera-based localization.
++- `video_navigation_demo_slam_memory.py`'s pose: `--pose slam` is real
++  camera-based visual SLAM (see "Visual SLAM" above for its limits),
++  `--pose phone` is phone dead reckoning, `--pose sim` is a deterministic
++  simulated trajectory.
+ - YOLO's tracker can assign a new ID to the same physical object after
+   occlusion or brief loss of track, so persistent-memory object counts can
+   run higher than the number of distinct real-world objects actually
+diff --git a/config.yaml b/config.yaml
+index b7b1219..b39f464 100644
+--- a/config.yaml
++++ b/config.yaml
+@@ -138,3 +138,61 @@ audio:
+   bluetooth_keywords: [bluetooth, hands-free, handsfree, a2dp, airpods, buds, enco]
+   # Names containing these (and no Bluetooth keyword) are wired headphones.
+   headphone_keywords: [headphone, earphone, headset]
++
++# ------------------------------------------------------------------
++# Visual SLAM (navigation/vslam.py), used with --pose slam.
++# Lightweight keyframe monocular SLAM on the laptop: ORB visual odometry,
++# metric scale from the phone's steps (or assumed_speed_m_s without the
++# phone), heading fused with the phone's rotation vector, loop closure +
++# 2D pose graph, and a saved map for relocalization on the next walk.
++# ------------------------------------------------------------------
++slam:
++  map_path: slam_map.npz     # saved keyframe map (--slam-map overrides)
++  process_every_n: 1         # run SLAM on every Nth frame
++  image_width: 640           # SLAM working width (frames are downscaled)
++  # Camera intrinsics. Run scripts/manual/calibrate_camera.py and paste the
++  # values here; with fx: null the intrinsics come from hfov_deg instead.
++  hfov_deg: 65.0
++  fx: null
++  fy: null
++  cx: null
++  cy: null
++  calib_width: null          # frame width the calibration was made at
++  camera_pitch_deg: 0.0      # chest mount tilt, positive = looking down
++  n_features: 1500           # ORB features per frame
++  map_features: 800          # features stored per keyframe
++  grid_cols: 8               # feature bucketing grid
++  grid_rows: 6
++  fast_threshold: 12
++  ratio_test: 0.75           # Lowe ratio for descriptor matches
++  ransac_px: 1.0             # essential-matrix RANSAC threshold (pixels)
++  min_inliers: 40            # below this the frame is not tracked
++  lost_frames: 8             # untracked frames in a row -> LOST
++  kf_min_inliers: 120        # new keyframe when inliers fall below this
++  kf_parallax_px: 25.0       # ... or translation parallax exceeds this
++  kf_yaw_deg: 15.0           # ... or the camera turned this much
++  kf_max_distance_m: 1.5     # ... or walked this far
++  min_trans_parallax_px: 2.0 # below this the motion is treated as rotation only
++  max_lateral_deg: 45.0      # visual direction more sideways -> use forward
++  dir_min_parallax_px: 8.0   # below this parallax the visual direction is too noisy -> use forward
++  assumed_speed_m_s: 1.0     # scale without the phone (recorded video)
++  heading_phone_weight: 0.05 # per keyframe pull towards the phone heading
++  loop_min_gap: 30           # keyframes between a loop's two ends
++  loop_radius_m: 3.0         # loop search radius ...
++  loop_radius_per_m: 0.05    # ... + this much per metre since the last loop
++  loop_candidates: 3
++  loop_min_ncc: 0.55         # thumbnail similarity for loop candidates
++  loop_min_inliers: 80
++  loop_max_odom_sigma: 4.0   # reject a loop that stretches odometry more than this
++  reloc_candidates: 5
++  reloc_min_inliers: 60
++  reloc_every_n: 3           # relocalization attempt every N processed frames
++  odom_sigma_m: 0.05         # pose-graph odometry std dev (m) ...
++  odom_sigma_per_m: 0.1      # ... + this per metre of the edge
++  odom_sigma_deg: 2.0
++  loop_sigma_m: 0.2          # metric loop / relocalization edges
++  loop_sigma_unscaled_m: 1.0 # rotation-only relocalization edges
++  loop_sigma_deg: 3.0
++  graph_loss: linear         # scipy least_squares loss
++  graph_f_scale: 3.0
++  save_every_kf: 20          # also save the map every N new keyframes
+diff --git a/navigation/memory.py b/navigation/memory.py
+index 8e366f1..32b8f31 100644
+--- a/navigation/memory.py
++++ b/navigation/memory.py
+@@ -89,10 +89,20 @@ class RouteMemory:
+             timestamp REAL NOT NULL,
+             decay_weight REAL NOT NULL DEFAULT 1.0,
+             velocity_x REAL NOT NULL DEFAULT 0.0,
+-            velocity_y REAL NOT NULL DEFAULT 0.0
++            velocity_y REAL NOT NULL DEFAULT 0.0,
++            anchor TEXT,
++            anchor_right REAL,
++            anchor_forward REAL
+         )
+     """
+ 
++    # Columns added after the hazard_id schema; ALTERed into older tables.
++    _ANCHOR_COLUMNS = (
++        ("anchor", "TEXT"),
++        ("anchor_right", "REAL"),
++        ("anchor_forward", "REAL"),
++    )
++
+     def __init__(
+         self,
+         db_path: str = "navigation_memory.db",
+@@ -129,6 +139,14 @@ class RouteMemory:
+             else:
+                 connection.execute(self._CREATE_SQL)
+ 
++            present = {
++                row[1]
++                for row in connection.execute("PRAGMA table_info(hazards)").fetchall()
++            }
++            for name, kind in self._ANCHOR_COLUMNS:
++                if name not in present:
++                    connection.execute(f"ALTER TABLE hazards ADD COLUMN {name} {kind}")
++
+             connection.execute(
+                 "CREATE INDEX IF NOT EXISTS idx_hazards_label ON hazards(label)"
+             )
+@@ -229,6 +247,7 @@ class RouteMemory:
+         velocity_x: float = 0.0,
+         velocity_y: float = 0.0,
+         persist: bool = True,
++        anchor: tuple[str, float, float] | None = None,
+     ) -> HazardEntry:
+         """Save a detection, merging it into an existing hazard if it matches.
+ 
+@@ -245,6 +264,11 @@ class RouteMemory:
+         A freshly (re)observed hazard is written with a full decay_weight
+         of 1.0. Every call also ages and prunes the rest of memory relative
+         to this timestamp, so the table stays bounded.
++
++        `anchor` = (keyframe anchor id, right_m, forward_m): the hazard's
++        position relative to the SLAM keyframe it was seen from. After a
++        loop closure moves that keyframe, `reanchor()` moves the hazard
++        with it. None (phone/sim pose) leaves the hazard unanchored.
+         """
+ 
+         if timestamp is None:
+@@ -285,9 +309,12 @@ class RouteMemory:
+                     timestamp,
+                     decay_weight,
+                     velocity_x,
+-                    velocity_y
++                    velocity_y,
++                    anchor,
++                    anchor_right,
++                    anchor_forward
+                 )
+-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
++                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 ON CONFLICT(hazard_id) DO UPDATE SET
+                     object_id = excluded.object_id,
+                     label = excluded.label,
+@@ -297,7 +324,10 @@ class RouteMemory:
+                     timestamp = excluded.timestamp,
+                     decay_weight = excluded.decay_weight,
+                     velocity_x = excluded.velocity_x,
+-                    velocity_y = excluded.velocity_y
++                    velocity_y = excluded.velocity_y,
++                    anchor = excluded.anchor,
++                    anchor_right = excluded.anchor_right,
++                    anchor_forward = excluded.anchor_forward
+                 """,
+                 (
+                     hazard_id,
+@@ -310,6 +340,9 @@ class RouteMemory:
+                     decay_weight,
+                     velocity_x,
+                     velocity_y,
++                    None if anchor is None else anchor[0],
++                    None if anchor is None else float(anchor[1]),
++                    None if anchor is None else float(anchor[2]),
+                 ),
+             )
+ 
+@@ -425,6 +458,38 @@ class RouteMemory:
+             for row in rows
+         ]
+ 
++    def reanchor(self, anchor_poses: dict[str, tuple[float, float, float]]) -> int:
++        """Move anchored hazards with their SLAM keyframes.
++
++        `anchor_poses` maps anchor id -> corrected keyframe pose
++        (x, y, heading_deg). Each anchored hazard's world position is
++        recomputed from its stored keyframe-relative offset (CLAUDE.md
++        local_to_world). Hazards whose anchor is unknown (other map, or
++        no anchor) are left alone. Returns the number of rows moved.
++        """
++        moved = 0
++        with contextlib.closing(self._connect()) as connection, connection:
++            rows = connection.execute(
++                """
++                SELECT hazard_id, anchor, anchor_right, anchor_forward
++                FROM hazards WHERE anchor IS NOT NULL
++                """
++            ).fetchall()
++            for hazard_id, anchor, right, forward in rows:
++                pose = anchor_poses.get(anchor)
++                if pose is None:
++                    continue
++                x, y, heading = pose
++                h = math.radians(heading)
++                world_x = x + right * math.cos(h) + forward * math.sin(h)
++                world_y = y - right * math.sin(h) + forward * math.cos(h)
++                connection.execute(
++                    "UPDATE hazards SET world_x = ?, world_y = ? WHERE hazard_id = ?",
++                    (world_x, world_y, hazard_id),
++                )
++                moved += 1
++        return moved
++
+     def clear(self) -> None:
+         """Delete all remembered hazards. Mainly useful for tests."""
+ 
+diff --git a/navigation/minimap.py b/navigation/minimap.py
+new file mode 100644
+index 0000000..c3f25ca
+--- /dev/null
++++ b/navigation/minimap.py
+@@ -0,0 +1,95 @@
++"""Top-down mini-map overlay for the annotated video (SLAM demo view).
++
++Draws, in a corner of the frame: the walked trajectory, SLAM keyframes,
++loop-closure links, remembered hazards (from persistent memory), the
++current position + heading, and the SLAM state. World frame (CLAUDE.md):
++x right, y forward (drawn upwards), heading clockwise from +y.
++"""
++
++from __future__ import annotations
++
++import math
++from typing import Iterable, Sequence
++
++import cv2
++import numpy as np
++
++STATE_COLORS = {
++    "TRACKING": (80, 220, 80),
++    "RELOCALIZING": (0, 200, 255),
++    "LOST": (60, 60, 255),
++    "INIT": (200, 200, 200),
++}
++
++
++def draw_minimap(
++    image: np.ndarray,
++    trajectory: Sequence[tuple[float, float]],
++    keyframes: Iterable[tuple[float, float]],
++    loop_links: Iterable[tuple[tuple[float, float], tuple[float, float]]],
++    hazards: Iterable[tuple[float, float, str, float]],
++    pose: tuple[float, float, float],
++    state: str,
++    info: str = "",
++    size: int = 260,
++    margin: int = 12,
++) -> None:
++    """Draw the mini-map in place in the bottom-right corner.
++
++    hazards: (world_x, world_y, label, decay_weight).
++    """
++    h_img, w_img = image.shape[:2]
++    size = min(size, int(0.45 * h_img), w_img - 2 * margin)
++    if size < 80:
++        return
++    x0, y0 = w_img - size - margin, h_img - size - margin
++    panel = image[y0 : y0 + size, x0 : x0 + size]
++    overlay = np.zeros_like(panel)
++    overlay[:] = (25, 25, 25)
++    cv2.addWeighted(overlay, 0.75, panel, 0.25, 0, panel)
++
++    keyframes = list(keyframes)
++    hazards = list(hazards)
++    loop_links = list(loop_links)
++    pts = list(trajectory) + keyframes + [(hx, hy) for hx, hy, _l, _w in hazards] + [pose[:2]]
++    xs = [p[0] for p in pts]
++    ys = [p[1] for p in pts]
++    span = max(max(xs) - min(xs), max(ys) - min(ys), 6.0) * 1.15
++    cx, cy = (max(xs) + min(xs)) / 2, (max(ys) + min(ys)) / 2
++    inner = size - 36
++    scale = inner / span
++
++    def to_px(x: float, y: float) -> tuple[int, int]:
++        return (
++            int(size / 2 + (x - cx) * scale),
++            int(size / 2 + 10 - (y - cy) * scale),
++        )
++
++    # 1 m scale bar
++    bar = max(int(scale), 4)
++    cv2.line(panel, (8, size - 10), (8 + bar, size - 10), (200, 200, 200), 2)
++    cv2.putText(panel, "1 m", (12 + bar, size - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200, 200, 200), 1)
++
++    for a, b in loop_links:
++        cv2.line(panel, to_px(*a), to_px(*b), (255, 120, 255), 1, cv2.LINE_AA)
++    if len(trajectory) >= 2:
++        poly = np.array([to_px(x, y) for x, y in trajectory], np.int32)
++        cv2.polylines(panel, [poly], False, (230, 200, 60), 1, cv2.LINE_AA)
++    for kx, ky in keyframes:
++        cv2.circle(panel, to_px(kx, ky), 2, (180, 180, 180), -1)
++    for hx, hy, label, weight in hazards:
++        shade = int(80 + 175 * max(0.0, min(weight, 1.0)))
++        p = to_px(hx, hy)
++        cv2.circle(panel, p, 4, (0, 0, shade), -1)
++        cv2.putText(panel, label[:8], (p[0] + 5, p[1] - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 0, shade), 1)
++
++    px, py = to_px(pose[0], pose[1])
++    h = math.radians(pose[2])
++    tip = (int(px + 14 * math.sin(h)), int(py - 14 * math.cos(h)))
++    color = STATE_COLORS.get(state, (255, 255, 255))
++    cv2.arrowedLine(panel, (px, py), tip, color, 2, cv2.LINE_AA, tipLength=0.4)
++    cv2.circle(panel, (px, py), 4, color, -1)
++
++    cv2.putText(panel, f"SLAM {state}", (6, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 1, cv2.LINE_AA)
++    if info:
++        cv2.putText(panel, info, (6, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (210, 210, 210), 1, cv2.LINE_AA)
+diff --git a/navigation/slam_eval.py b/navigation/slam_eval.py
+new file mode 100644
+index 0000000..7cfa142
+--- /dev/null
++++ b/navigation/slam_eval.py
+@@ -0,0 +1,92 @@
++"""Trajectory evaluation helpers (no external `evo` dependency).
++
++- associate(): match estimated and ground-truth timestamps (TUM style).
++- umeyama(): best similarity transform (rotation, translation, scale)
++  between two point sets (Umeyama 1991), any dimension.
++- ate_rmse(): absolute trajectory error after alignment.
++- project_to_plane(): fit the dominant plane of a 3D ground-truth path
++  and express it in 2D, so it can be compared with our 2D ground-plane
++  SLAM pose.
++- loop_drift(): start-to-end error of a closed-loop walk.
++"""
++
++from __future__ import annotations
++
++import math
++from typing import Sequence
++
++import numpy as np
++from numpy.typing import NDArray
++
++
++def associate(
++    est_times: Sequence[float],
++    gt_times: Sequence[float],
++    max_dt: float = 0.02,
++) -> list[tuple[int, int]]:
++    """Pairs (i_est, i_gt) of nearest timestamps within `max_dt` seconds."""
++    gt = np.asarray(gt_times, dtype=float)
++    pairs = []
++    for i, t in enumerate(est_times):
++        j = int(np.argmin(np.abs(gt - t)))
++        if abs(gt[j] - t) <= max_dt:
++            pairs.append((i, j))
++    return pairs
++
++
++def umeyama(
++    src: NDArray[np.float64], dst: NDArray[np.float64], with_scale: bool = True
++) -> tuple[NDArray[np.float64], NDArray[np.float64], float]:
++    """R, t, s minimizing sum ||dst - (s R src + t)||^2. Rows are points."""
++    src = np.asarray(src, dtype=float)
++    dst = np.asarray(dst, dtype=float)
++    n, dim = src.shape
++    mu_s, mu_d = src.mean(axis=0), dst.mean(axis=0)
++    xs, xd = src - mu_s, dst - mu_d
++    cov = xd.T @ xs / n
++    U, D, Vt = np.linalg.svd(cov)
++    S = np.eye(dim)
++    if np.linalg.det(U) * np.linalg.det(Vt) < 0:
++        S[-1, -1] = -1
++    R = U @ S @ Vt
++    var_s = (xs**2).sum() / n
++    s = float(np.trace(np.diag(D) @ S) / var_s) if with_scale and var_s > 0 else 1.0
++    t = mu_d - s * R @ mu_s
++    return R, t, s
++
++
++def ate_rmse(
++    est: NDArray[np.float64], gt: NDArray[np.float64], with_scale: bool = True
++) -> tuple[float, NDArray[np.float64]]:
++    """RMSE of position error after Umeyama alignment; also the aligned est."""
++    R, t, s = umeyama(est, gt, with_scale)
++    aligned = (s * (R @ np.asarray(est, float).T)).T + t
++    err = np.linalg.norm(aligned - gt, axis=1)
++    return float(np.sqrt(np.mean(err**2))), aligned
++
++
++def project_to_plane(points: NDArray[np.float64]) -> NDArray[np.float64]:
++    """2D coordinates of 3D points in their best-fit plane (PCA)."""
++    pts = np.asarray(points, dtype=float)
++    centred = pts - pts.mean(axis=0)
++    _U, _S, Vt = np.linalg.svd(centred, full_matrices=False)
++    return centred @ Vt[:2].T
++
++
++def path_length(xy: NDArray[np.float64]) -> float:
++    xy = np.asarray(xy, dtype=float)
++    if len(xy) < 2:
++        return 0.0
++    return float(np.sum(np.linalg.norm(np.diff(xy, axis=0), axis=1)))
++
++
++def loop_drift(xy: NDArray[np.float64]) -> dict[str, float]:
++    """For a walk that ends where it started: distance, end error, drift %."""
++    xy = np.asarray(xy, dtype=float)
++    length = path_length(xy)
++    end_error = float(math.hypot(*(xy[-1] - xy[0]))) if len(xy) else 0.0
++    return {
++        "distance_m": length,
++        "end_error_m": end_error,
++        "drift_percent": 100.0 * end_error / length if length > 0 else 0.0,
++    }
+diff --git a/navigation/synthetic_scene.py b/navigation/synthetic_scene.py
+new file mode 100644
+index 0000000..399de07
+--- /dev/null
++++ b/navigation/synthetic_scene.py
+@@ -0,0 +1,203 @@
++"""Synthetic camera walk for testing the visual SLAM (simulation only).
++
++Renders a chest-height camera walking inside a square room whose four
++walls carry a unique random texture. The true camera pose is known, so
++SLAM output can be checked against ground truth without a phone, a
++camera or a dataset download. Also provides a fake phone helper with
++realistic step-length and heading errors (the dead-reckoning baseline).
++
++World frame (CLAUDE.md): x right, y forward, z up; heading clockwise
++from +y. Camera: x right, y down, z forward.
++"""
++
++from __future__ import annotations
++
++import math
++from dataclasses import dataclass, field
++
++import cv2
++import numpy as np
++from numpy.typing import NDArray
++
++from navigation.models import Pose
++
++PX_PER_M = 120
++
++
++def make_texture(width_m: float, height_m: float, seed: int) -> NDArray[np.uint8]:
++    """Unique, corner-rich grayscale texture (random shapes + fine noise)."""
++    rng = np.random.default_rng(seed)
++    w, h = int(width_m * PX_PER_M), int(height_m * PX_PER_M)
++    img = np.full((h, w), 128, np.uint8)
++    for _ in range(int(width_m * height_m * 25)):
++        x, y = int(rng.integers(0, w)), int(rng.integers(0, h))
++        size = int(rng.integers(6, 60))
++        color = int(rng.integers(0, 256))
++        kind = rng.integers(0, 3)
++        if kind == 0:
++            cv2.rectangle(img, (x, y), (x + size, y + int(size * rng.uniform(0.3, 1.5))), color, -1)
++        elif kind == 1:
++            cv2.circle(img, (x, y), size // 2, color, -1)
++        else:
++            pts = rng.integers(-size, size, size=(3, 2)) + np.array([x, y])
++            cv2.fillPoly(img, [pts.astype(np.int32)], color)
++    noise = rng.normal(0, 6, img.shape)
++    return np.clip(img.astype(np.float64) + noise, 0, 255).astype(np.uint8)
++
++
++@dataclass
++class Room:
++    half_size_m: float = 8.0
++    height_m: float = 3.0
++    seed: int = 7
++    walls: list[tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.uint8]]] = field(default_factory=list)
++
++    def __post_init__(self) -> None:
++        s, hgt = self.half_size_m, self.height_m
++        corners = [(-s, s), (s, s), (s, -s), (-s, -s)]
++        for n in range(4):
++            a = np.array([*corners[n], 0.0])
++            b = np.array([*corners[(n + 1) % 4], 0.0])
++            length = float(np.linalg.norm(b - a))
++            self.walls.append((a, b, make_texture(length, hgt, self.seed * 10 + n)))
++
++
++def camera_axes(heading_deg: float, pitch_deg: float) -> NDArray[np.float64]:
++    """Rows: camera x (right), y (down), z (forward) in world coords."""
++    h, p = math.radians(heading_deg), math.radians(pitch_deg)
++    r = np.array([math.cos(h), -math.sin(h), 0.0])
++    f0 = np.array([math.sin(h), math.cos(h), 0.0])
++    d0 = np.array([0.0, 0.0, -1.0])
++    f = math.cos(p) * f0 + math.sin(p) * d0
++    d = math.cos(p) * d0 - math.sin(p) * f0
++    return np.stack([r, d, f])
++
++
++def render(
++    room: Room,
++    x: float,
++    y: float,
++    heading_deg: float,
++    K: NDArray[np.float64],
++    size: tuple[int, int] = (640, 360),
++    cam_height_m: float = 1.3,
++    pitch_deg: float = 0.0,
++    strip_m: float = 0.5,
++) -> NDArray[np.uint8]:
++    w_img, h_img = size
++    canvas = np.full((h_img, w_img), 90, np.uint8)
++    canvas[h_img // 2 :, :] = 60  # flat floor tone below the horizon
++    axes = camera_axes(heading_deg, pitch_deg)
++    centre = np.array([x, y, cam_height_m])
++    for a, b, tex in room.walls:
++        length = float(np.linalg.norm(b - a))
++        direction = (b - a) / length
++        n_strips = int(math.ceil(length / strip_m))
++        for k in range(n_strips):
++            s0, s1 = k * strip_m, min((k + 1) * strip_m, length)
++            p0, p1 = a + direction * s0, a + direction * s1
++            corners3d = [
++                p0 + [0, 0, room.height_m],
++                p1 + [0, 0, room.height_m],
++                p1,
++                p0,
++            ]
++            cam = np.array([axes @ (c - centre) for c in corners3d])
++            if np.any(cam[:, 2] < 0.3):
++                continue
++            proj = (K @ cam.T).T
++            dst = (proj[:, :2] / proj[:, 2:3]).astype(np.float32)
++            x0, y0 = np.floor(dst.min(axis=0)).astype(int)
++            x1, y1 = np.ceil(dst.max(axis=0)).astype(int)
++            x0, y0 = max(x0, 0), max(y0, 0)
++            x1, y1 = min(x1, w_img), min(y1, h_img)
++            if x1 <= x0 or y1 <= y0:
++                continue
++            u0, u1 = int(s0 * PX_PER_M), int(s1 * PX_PER_M)
++            th = tex.shape[0]
++            src = np.array([[u0, 0], [u1, 0], [u1, th - 1], [u0, th - 1]], np.float32)
++            H = cv2.getPerspectiveTransform(src, dst - np.array([x0, y0], np.float32))
++            roi_w, roi_h = x1 - x0, y1 - y0
++            warped = cv2.warpPerspective(tex, H, (roi_w, roi_h), flags=cv2.INTER_LINEAR, borderValue=0)
++            mask = cv2.warpPerspective(
++                np.full_like(tex, 255), H, (roi_w, roi_h), flags=cv2.INTER_NEAREST, borderValue=0
++            )
++            roi = canvas[y0:y1, x0:x1]
++            np.copyto(roi, warped, where=mask > 0)
++    return canvas
++
++
++def square_walk(
++    side_m: float = 8.0,
++    laps: int = 1,
++    speed_m_s: float = 1.0,
++    turn_deg_s: float = 60.0,
++    fps: float = 10.0,
++) -> list[tuple[float, float, float, float]]:
++    """(t, x, y, heading) of a clockwise square walk that returns to start.
++    Starts at (-side/2, -side/2) facing +y (heading 0)."""
++    out = []
++    t = 0.0
++    x, y, h = -side_m / 2, -side_m / 2, 0.0
++    dt = 1.0 / fps
++    step = speed_m_s * dt
++    for _lap in range(laps):
++        for _edge in range(4):
++            travelled = 0.0
++            while travelled < side_m - 1e-9:
++                out.append((t, x, y, h))
++                d = min(step, side_m - travelled)
++                x += d * math.sin(math.radians(h))
++                y += d * math.cos(math.radians(h))
++                travelled += d
++                t += dt
++            turned = 0.0
++            while turned < 90.0 - 1e-9:
++                out.append((t, x, y, h))
++                d = min(turn_deg_s * dt, 90.0 - turned)
++                h = (h + d) % 360.0
++                turned += d
++                t += dt
++    out.append((t, x, y, h))
++    return out
++
++
++class FakePhone:
++    """Dead-reckoning phone: steps of `true_stride_m` counted, but the
++    pipeline assumes `stride_m`; heading drifts at `drift_deg_s`."""
++
++    def __init__(
++        self,
++        stride_m: float = 0.7,
++        true_stride_m: float = 0.75,
++        drift_deg_s: float = 0.15,
++        noise_deg: float = 1.0,
++        seed: int = 3,
++    ) -> None:
++        self.stride_m = stride_m
++        self.true_stride_m = true_stride_m
++        self.drift_deg_s = drift_deg_s
++        self.noise_deg = noise_deg
++        self.rng = np.random.default_rng(seed)
++        self.step_count = 0
++        self._walked = 0.0
++        self._heading = 0.0
++        self._x = 0.0
++        self._y = 0.0
++        self._t = 0.0
++        self._last_xy: tuple[float, float] | None = None
++
++    def update(self, t: float, x: float, y: float, heading: float) -> None:
++        if self._last_xy is not None:
++            self._walked += math.hypot(x - self._last_xy[0], y - self._last_xy[1])
++        self._last_xy = (x, y)
++        self._t = t
++        self._heading = heading + self.drift_deg_s * t + float(self.rng.normal(0, self.noise_deg))
++        while self._walked >= (self.step_count + 1) * self.true_stride_m:
++            self.step_count += 1
++            h = math.radians(self._heading)
++            self._x += self.stride_m * math.sin(h)
++            self._y += self.stride_m * math.cos(h)
++
++    def get_pose(self, t: float) -> Pose:
++        return Pose(x=self._x, y=self._y, heading_deg=((self._heading + 180) % 360) - 180, timestamp=t, valid=True)
+diff --git a/navigation/vslam.py b/navigation/vslam.py
+new file mode 100644
+index 0000000..2305c42
+--- /dev/null
++++ b/navigation/vslam.py
+@@ -0,0 +1,1074 @@
++"""Lightweight keyframe monocular visual SLAM with inertial-assisted scale.
++
++What it is
++----------
++A real (not simulated) camera-based SLAM that runs on the laptop in plain
++Python + OpenCV + NumPy + SciPy, behind the same `Pose` interface as
++`PhonePose` and `simulated_pose()`:
++
++- Tracking (visual odometry): ORB features on the chest-camera frame are
++  matched against the current keyframe; the essential matrix (RANSAC)
++  gives the camera rotation and translation direction. Features on
++  dynamic YOLO boxes (people, vehicles, animals) are masked out first.
++- Metric scale: one camera cannot measure distance, so the length of each
++  movement comes from the phone's step counter (steps x stride) when the
++  phone is connected, otherwise from an assumed walking speed.
++- Heading fusion: the visual yaw is pulled gently towards the phone's
++  rotation-vector heading at every keyframe (complementary filter), which
++  limits long-term yaw drift.
++- Mapping: keyframes (pose + ORB keypoints/descriptors + a tiny thumbnail
++  for place recognition) form the map.
++- Loop closure: when a new keyframe looks like an old one nearby, a loop
++  edge is added and a 2D pose graph (x, y, heading) is optimized with
++  scipy.optimize.least_squares (false loops are rejected by a consistency
++  check). All keyframe poses
++  move, and hazards anchored to keyframes move with them.
++- Persistence + relocalization: the map is saved to disk. On the next run
++  the first frames are matched against the saved keyframes; once one is
++  recognized, this run continues in the SAME world frame as the previous
++  run, so hazards in persistent memory line up across walks.
++- Tracking loss: falls back to phone dead reckoning (if connected) while
++  trying to re-find a known keyframe.
++
++What it is not
++--------------
++Not ORB-SLAM3. The pose is 2D on a flat ground plane (x, y, heading),
++loop edges constrain heading tightly but translation only loosely (they
++assume the two views were taken close together), and there is no bundle
++adjustment or 3D map. Low texture, low light and very fast turns can
++lose tracking.
++
++Conventions (CLAUDE.md)
++-----------------------
++World frame: x = right of the start heading, y = forward at the start.
++Heading: degrees clockwise from +y. Camera (OpenCV): x right, y down,
++z forward.
++"""
++
++from __future__ import annotations
++
++import math
++import uuid
++from dataclasses import dataclass, field, fields
++from pathlib import Path
++from typing import Any, Callable, Iterable, Protocol, Sequence
++
++import cv2
++import numpy as np
++from numpy.typing import NDArray
++
++from navigation.models import Pose
++
++
++# States reported by VisualSLAM.state
++INIT = "INIT"  # no map yet, waiting for the first frame
++RELOCALIZING = "RELOCALIZING"  # map loaded, not yet recognized where we are
++TRACKING = "TRACKING"
++LOST = "LOST"  # visual tracking lost; phone dead reckoning if available
++
++EDGE_ODOM = 0
++EDGE_LOOP = 1
++EDGE_RELOC = 2
++
++THUMB_SIZE = (32, 24)  # (w, h) for the place-recognition thumbnail
++
++
++# ---------------------------------------------------------------------------
++# Config
++# ---------------------------------------------------------------------------
++
++
++@dataclass(frozen=True)
++class SlamConfig:
++    """All tunables; built from config.yaml's `slam` section."""
++
++    image_width: int = 640
++    hfov_deg: float = 65.0
++    # Calibrated intrinsics at the ORIGINAL frame size (null = use hfov_deg).
++    fx: float | None = None
++    fy: float | None = None
++    cx: float | None = None
++    cy: float | None = None
++    calib_width: int | None = None  # frame width the calibration was made at
++    camera_pitch_deg: float = 0.0  # positive = camera tilted down
++    n_features: int = 1500
++    map_features: int = 800
++    grid_cols: int = 8
++    grid_rows: int = 6
++    fast_threshold: int = 12
++    ratio_test: float = 0.75
++    ransac_px: float = 1.0
++    min_inliers: int = 40
++    lost_frames: int = 8
++    kf_min_inliers: int = 120
++    kf_parallax_px: float = 25.0
++    kf_yaw_deg: float = 15.0
++    kf_max_distance_m: float = 1.5
++    min_trans_parallax_px: float = 2.0
++    max_lateral_deg: float = 45.0
++    dir_min_parallax_px: float = 8.0
++    assumed_speed_m_s: float = 1.0
++    heading_phone_weight: float = 0.05
++    loop_min_gap: int = 30
++    loop_radius_m: float = 3.0
++    loop_radius_per_m: float = 0.05
++    loop_candidates: int = 3
++    loop_min_ncc: float = 0.55
++    loop_min_inliers: int = 80
++    reloc_candidates: int = 5
++    reloc_min_inliers: int = 60
++    reloc_every_n: int = 3
++    odom_sigma_m: float = 0.05
++    odom_sigma_per_m: float = 0.1
++    odom_sigma_deg: float = 2.0
++    loop_sigma_m: float = 0.2
++    loop_sigma_unscaled_m: float = 1.0
++    loop_sigma_deg: float = 3.0
++    save_every_kf: int = 20
++    graph_loss: str = "linear"
++    graph_f_scale: float = 3.0
++    loop_max_odom_sigma: float = 4.0
++
++    @classmethod
++    def from_config(cls, section: dict[str, Any]) -> "SlamConfig":
++        """Build from the `slam` dict; keys that are not fields are ignored
++        (e.g. map_path, process_every_n, used by the demo script)."""
++        names = {f.name for f in fields(cls)}
++        return cls(**{k: v for k, v in section.items() if k in names})
++
++
++def camera_matrix(cfg: SlamConfig, frame_width: int, frame_height: int) -> NDArray[np.float64]:
++    """Intrinsics at the SLAM working resolution (cfg.image_width)."""
++    scale_to_work = cfg.image_width / float(frame_width)
++    if cfg.fx is not None and cfg.fy is not None:
++        calib_w = float(cfg.calib_width or frame_width)
++        s = cfg.image_width / calib_w
++        fx, fy = cfg.fx * s, cfg.fy * s
++        cx = (cfg.cx if cfg.cx is not None else calib_w / 2.0) * s
++        cy = (cfg.cy if cfg.cy is not None else frame_height * calib_w / frame_width / 2.0) * s
++    else:
++        work_w = cfg.image_width
++        work_h = frame_height * scale_to_work
++        fx = fy = (work_w / 2.0) / math.tan(math.radians(cfg.hfov_deg) / 2.0)
++        cx, cy = work_w / 2.0, work_h / 2.0
++    return np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]])
++
++
++# ---------------------------------------------------------------------------
++# 2D pose maths (CLAUDE.md world frame)
++# ---------------------------------------------------------------------------
++
++
++def wrap_deg(angle: float) -> float:
++    return (angle + 180.0) % 360.0 - 180.0
++
++
++def compose(pose: Sequence[float], right: float, forward: float, dyaw_deg: float) -> tuple[float, float, float]:
++    """Apply a motion given in the frame of `pose` (x, y, heading_deg)."""
++    x, y, h = pose
++    hr = math.radians(h)
++    return (
++        x + right * math.cos(hr) + forward * math.sin(hr),
++        y - right * math.sin(hr) + forward * math.cos(hr),
++        wrap_deg(h + dyaw_deg),
++    )
++
++
++def relative(pose_i: Sequence[float], pose_j: Sequence[float]) -> tuple[float, float, float]:
++    """Motion (right, forward, dyaw) of pose_j expressed in pose_i's frame."""
++    xi, yi, hi = pose_i
++    xj, yj, hj = pose_j
++    hr = math.radians(hi)
++    dx, dy = xj - xi, yj - yi
++    return (
++        dx * math.cos(hr) - dy * math.sin(hr),
++        dx * math.sin(hr) + dy * math.cos(hr),
++        wrap_deg(hj - hi),
++    )
++
++
++def rot_x(angle_rad: float) -> NDArray[np.float64]:
++    c, s = math.cos(angle_rad), math.sin(angle_rad)
++    return np.array([[1.0, 0.0, 0.0], [0.0, c, -s], [0.0, s, c]])
++
++
++def ground_motion_full(
++    R: NDArray[np.float64], t: NDArray[np.float64], pitch_deg: float = 0.0
++) -> tuple[float, float, float]:
++    """Camera motion -> (dyaw_deg, right, forward) on the ground, with the
++    translation length kept (metric if `t` is metric).
++
++    `R, t` follow OpenCV `recoverPose(points_ref, points_cur)` /
++    `solvePnP(points_in_ref_frame, pixels_cur)`: they map a point from the
++    reference camera frame into the current camera frame
++    (X_cur = R X_ref + t). The camera's own motion is the inverse. A camera
++    tilted down by `pitch_deg` is first rotated back to a level frame.
++    """
++    Rp = rot_x(math.radians(pitch_deg))  # level -> camera
++    Rg = Rp.T @ R @ Rp
++    tg = Rp.T @ np.asarray(t, dtype=float).reshape(3)
++    forward_axis = Rg.T @ np.array([0.0, 0.0, 1.0])  # current forward, in ref frame
++    dyaw = math.degrees(math.atan2(forward_axis[0], forward_axis[2]))
++    centre = -Rg.T @ tg  # current camera centre in the reference frame
++    return dyaw, float(centre[0]), float(centre[2])
++
++
++def ground_motion(
++    R: NDArray[np.float64], t: NDArray[np.float64], pitch_deg: float = 0.0
++) -> tuple[float, float, float]:
++    """Like ground_motion_full, but the direction is a unit vector (or
++    (0, 0) for no translation): monocular translation has no scale."""
++    dyaw, right, fwd = ground_motion_full(R, t, pitch_deg)
++    norm = math.hypot(right, fwd)
++    if norm < 1e-9:
++        return dyaw, 0.0, 0.0
++    return dyaw, right / norm, fwd / norm
++
++
++def kabsch_rotation(rays_ref: NDArray[np.float64], rays_cur: NDArray[np.float64]) -> NDArray[np.float64]:
++    """Best rotation R with rays_cur ~ R @ rays_ref (rotation-only motion)."""
++    H = rays_ref.T @ rays_cur
++    U, _S, Vt = np.linalg.svd(H)
++    d = np.sign(np.linalg.det(Vt.T @ U.T)) or 1.0
++    return Vt.T @ np.diag([1.0, 1.0, d]) @ U.T
++
++
++# ---------------------------------------------------------------------------
++# Features
++# ---------------------------------------------------------------------------
++
++
++@dataclass
++class FrameFeatures:
++    keypoints: NDArray[np.float32]  # (N, 2) pixel coords at work resolution
++    descriptors: NDArray[np.uint8]  # (N, 32)
++    thumb: NDArray[np.float32]  # normalized thumbnail, flattened
++
++
++def make_thumb(gray: NDArray[np.uint8]) -> NDArray[np.float32]:
++    small = cv2.resize(gray, THUMB_SIZE, interpolation=cv2.INTER_AREA).astype(np.float32)
++    small -= small.mean()
++    std = float(small.std())
++    if std > 1e-6:
++        small /= std
++    return small.reshape(-1)
++
++
++def thumb_ncc(a: NDArray[np.float32], b: NDArray[np.float32]) -> float:
++    return float(np.dot(a, b) / a.size)
++
++
++class FeatureExtractor:
++    def __init__(self, cfg: SlamConfig) -> None:
++        self.cfg = cfg
++        self.orb = cv2.ORB_create(
++            nfeatures=cfg.n_features * 2,
++            scaleFactor=1.2,
++            nlevels=8,
++            fastThreshold=cfg.fast_threshold,
++        )
++
++    def extract(
++        self,
++        gray: NDArray[np.uint8],
++        mask_boxes: Iterable[Sequence[float]] = (),
++    ) -> FrameFeatures:
++        h, w = gray.shape[:2]
++        mask = np.full((h, w), 255, dtype=np.uint8)
++        for x1, y1, x2, y2 in mask_boxes:
++            cv2.rectangle(
++                mask,
++                (int(max(x1, 0)), int(max(y1, 0))),
++                (int(min(x2, w - 1)), int(min(y2, h - 1))),
++                0,
++                -1,
++            )
++        keypoints = self.orb.detect(gray, mask)
++        keypoints = self._bucket(keypoints, w, h)
++        keypoints, descriptors = self.orb.compute(gray, keypoints)
++        if descriptors is None or not keypoints:
++            return FrameFeatures(
++                np.zeros((0, 2), np.float32), np.zeros((0, 32), np.uint8), make_thumb(gray)
++            )
++        pts = np.array([kp.pt for kp in keypoints], dtype=np.float32)
++        return FrameFeatures(pts, descriptors, make_thumb(gray))
++
++    def _bucket(self, keypoints: Sequence[cv2.KeyPoint], w: int, h: int) -> list[cv2.KeyPoint]:
++        """Keep the strongest corners per grid cell so features spread out."""
++        cols, rows = self.cfg.grid_cols, self.cfg.grid_rows
++        per_cell = max(1, self.cfg.n_features // (cols * rows))
++        cells: dict[tuple[int, int], list[cv2.KeyPoint]] = {}
++        for kp in keypoints:
++            cx = min(int(kp.pt[0] * cols / w), cols - 1)
++            cy = min(int(kp.pt[1] * rows / h), rows - 1)
++            cells.setdefault((cx, cy), []).append(kp)
++        kept: list[cv2.KeyPoint] = []
++        for cell in cells.values():
++            cell.sort(key=lambda k: k.response, reverse=True)
++            kept.extend(cell[:per_cell])
++        return kept
++
++
++@dataclass
++class MotionEstimate:
++    dyaw_deg: float
++    dir_right: float
++    dir_forward: float
++    inliers: int
++    parallax_px: float  # median displacement of inliers
++    trans_parallax_px: float  # displacement left after removing rotation
++    rotation_only: bool
++
++
++class MotionEstimator:
++    def __init__(self, cfg: SlamConfig, K: NDArray[np.float64]) -> None:
++        self.cfg = cfg
++        self.K = K
++        self.K_inv = np.linalg.inv(K)
++        self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
++
++    def match(self, des_ref: NDArray[np.uint8], des_cur: NDArray[np.uint8]) -> list[tuple[int, int]]:
++        if len(des_ref) < 2 or len(des_cur) < 2:
++            return []
++        pairs = self.matcher.knnMatch(des_ref, des_cur, k=2)
++        good = []
++        for pair in pairs:
++            if len(pair) == 2 and pair[0].distance < self.cfg.ratio_test * pair[1].distance:
++                good.append((pair[0].queryIdx, pair[0].trainIdx))
++        return good
++
++    def _rays(self, pts: NDArray[np.float64]) -> NDArray[np.float64]:
++        homog = np.hstack([pts, np.ones((len(pts), 1))])
++        rays = (self.K_inv @ homog.T).T
++        return rays / np.linalg.norm(rays, axis=1, keepdims=True)
++
++    def estimate(
++        self, ref: FrameFeatures, cur: FrameFeatures, min_inliers: int
++    ) -> MotionEstimate | None:
++        """Relative motion of `cur` with respect to `ref`, or None."""
++        good = self.match(ref.descriptors, cur.descriptors)
++        if len(good) < max(min_inliers, 8):
++            return None
++        p_ref = ref.keypoints[[g[0] for g in good]].astype(np.float64)
++        p_cur = cur.keypoints[[g[1] for g in good]].astype(np.float64)
++
++        E, mask = cv2.findEssentialMat(
++            p_ref, p_cur, self.K, method=cv2.RANSAC, prob=0.999, threshold=self.cfg.ransac_px
++        )
++        if E is None or mask is None:
++            return None
++        if E.shape[0] > 3:  # several solutions: keep the first
++            E = E[:3]
++        inl = mask.ravel().astype(bool)
++        if int(inl.sum()) < min_inliers:
++            return None
++        p_ref, p_cur = p_ref[inl], p_cur[inl]
++        parallax = float(np.median(np.linalg.norm(p_cur - p_ref, axis=1)))
++
++        # Rotation-only model: how much displacement is left after
++        # de-rotating? Small -> translation is not observable this frame.
++        R_rot = kabsch_rotation(self._rays(p_ref), self._rays(p_cur))
++        H = self.K @ R_rot @ self.K_inv
++        warped = cv2.perspectiveTransform(p_ref.reshape(-1, 1, 2), H).reshape(-1, 2)
++        trans_parallax = float(np.median(np.linalg.norm(p_cur - warped, axis=1)))
++
++        if trans_parallax < self.cfg.min_trans_parallax_px:
++            dyaw, _r, _f = ground_motion(R_rot, np.zeros(3), self.cfg.camera_pitch_deg)
++            return MotionEstimate(dyaw, 0.0, 0.0, int(inl.sum()), parallax, trans_parallax, True)
++
++        n_ok, R, t, pose_mask = cv2.recoverPose(E, p_ref, p_cur, self.K)
++        if n_ok < min_inliers // 2:
++            dyaw, _r, _f = ground_motion(R_rot, np.zeros(3), self.cfg.camera_pitch_deg)
++            return MotionEstimate(dyaw, 0.0, 0.0, int(inl.sum()), parallax, trans_parallax, True)
++        dyaw, dr, df = ground_motion(R, t, self.cfg.camera_pitch_deg)
++        return MotionEstimate(dyaw, dr, df, int(inl.sum()), parallax, trans_parallax, False)
++
++
++    def triangulate(
++        self, a: FrameFeatures, b: FrameFeatures, baseline_m: float
++    ) -> tuple[NDArray[np.int64], NDArray[np.float64]] | None:
++        """3D points (in a's camera frame, metres) seen by keyframes a and b.
++
++        The two keyframes' metric distance `baseline_m` (from the pose
++        graph) fixes the scale. Returns (indices into a's features, points).
++        """
++        good = self.match(a.descriptors, b.descriptors)
++        if len(good) < 30:
++            return None
++        ia = np.array([g[0] for g in good])
++        pa = a.keypoints[ia].astype(np.float64)
++        pb = b.keypoints[[g[1] for g in good]].astype(np.float64)
++        E, mask = cv2.findEssentialMat(pa, pb, self.K, method=cv2.RANSAC, prob=0.999, threshold=self.cfg.ransac_px)
++        if E is None or mask is None:
++            return None
++        if E.shape[0] > 3:
++            E = E[:3]
++        _n, R, t, pose_mask = cv2.recoverPose(E, pa, pb, self.K, mask=mask.copy())
++        keep = pose_mask.ravel() > 0
++        if keep.sum() < 20:
++            return None
++        ia, pa, pb = ia[keep], pa[keep], pb[keep]
++        t = t.reshape(3) * baseline_m
++        P1 = self.K @ np.hstack([np.eye(3), np.zeros((3, 1))])
++        P2 = self.K @ np.hstack([R, t.reshape(3, 1)])
++        X = cv2.triangulatePoints(P1, P2, pa.T, pb.T)
++        X = (X[:3] / X[3]).T
++        Xb = (R @ X.T).T + t
++        ok = (X[:, 2] > 0.3) & (Xb[:, 2] > 0.3) & (X[:, 2] < 60.0)
++        # Reject points with a tiny triangulation angle (unreliable depth).
++        rays_a = X / np.linalg.norm(X, axis=1, keepdims=True)
++        cb = -R.T @ t
++        rays_b = (X - cb) / np.linalg.norm(X - cb, axis=1, keepdims=True)
++        angle = np.degrees(np.arccos(np.clip(np.sum(rays_a * rays_b, axis=1), -1, 1)))
++        ok &= angle > 1.0
++        if ok.sum() < 20:
++            return None
++        return ia[ok], X[ok]
++
++    def metric_relative(
++        self,
++        a: FrameFeatures,
++        cloud: tuple[NDArray[np.int64], NDArray[np.float64]],
++        cur: FrameFeatures,
++        min_inliers: int,
++    ) -> tuple[tuple[float, float, float], int] | None:
++        """Metric (right, forward, dyaw) of `cur` in a's frame via PnP."""
++        idx, pts3d = cloud
++        lookup = {int(k): n for n, k in enumerate(idx)}
++        good = [g for g in self.match(a.descriptors, cur.descriptors) if g[0] in lookup]
++        if len(good) < max(min_inliers // 2, 12):
++            return None
++        obj = np.array([pts3d[lookup[g[0]]] for g in good], dtype=np.float64)
++        img = np.array([cur.keypoints[g[1]] for g in good], dtype=np.float64)
++        ok, rvec, tvec, inliers = cv2.solvePnPRansac(
++            obj, img, self.K, None, reprojectionError=2.0, iterationsCount=200, confidence=0.999
++        )
++        if not ok or inliers is None or len(inliers) < max(min_inliers // 2, 12):
++            return None
++        R, _ = cv2.Rodrigues(rvec)
++        dyaw, right, fwd = ground_motion_full(R, tvec, self.cfg.camera_pitch_deg)
++        return (right, fwd, dyaw), int(len(inliers))
++
++
++# ---------------------------------------------------------------------------
++# Map
++# ---------------------------------------------------------------------------
++
++
++@dataclass
++class Keyframe:
++    kf_id: int
++    timestamp: float
++    pose: tuple[float, float, float]
++    features: FrameFeatures
++    odometer_m: float = 0.0  # helper odometer when created (this session)
++
++
++@dataclass
++class Edge:
++    i: int  # kf_id
++    j: int
++    meas: tuple[float, float, float]  # (right, forward, dyaw) of j in i's frame
++    kind: int = EDGE_ODOM
++    sigma_m: float = 0.0  # 0 = use the default for this edge kind
++
++
++def edge_residual(
++    poses: dict[int, tuple[float, float, float]], e: Edge, sigma_t: float, sigma_h_deg: float
++) -> float:
++    """Largest whitened residual (in sigmas) of one edge."""
++    r, f, dh = relative(poses[e.i], poses[e.j])
++    return max(
++        abs(r - e.meas[0]) / sigma_t,
++        abs(f - e.meas[1]) / sigma_t,
++        abs(wrap_deg(dh - e.meas[2])) / sigma_h_deg,
++    )
++
++
++def optimize_pose_graph(
++    poses: dict[int, tuple[float, float, float]],
++    edges: Sequence[Edge],
++    fixed: int,
++    sigmas: Callable[[Edge], tuple[float, float]],
++    loss: str = "linear",
++    f_scale: float = 3.0,
++) -> dict[int, tuple[float, float, float]]:
++    """2D pose-graph optimization (x, y, heading) by least squares.
++
++    Plain least squares ("linear") spreads a genuine loop correction over
++    the whole loop. Robust losses (cauchy, huber) treat a large real
++    correction after long drift as an outlier, so false loops are instead
++    rejected by `VisualSLAM` with a consistency check after optimizing."""
++    from scipy.optimize import least_squares
++    from scipy.sparse import lil_matrix
++
++    ids = [k for k in poses if k != fixed]
++    if not ids or not edges:
++        return dict(poses)
++    index = {k: n for n, k in enumerate(ids)}
++    x0 = np.array(
++        [v for k in ids for v in (poses[k][0], poses[k][1], math.radians(poses[k][2]))]
++    )
++    fixed_pose = poses[fixed]
++    used = [e for e in edges if e.i in poses and e.j in poses]
++    weights = np.array([[1.0 / s_t, 1.0 / s_t, 1.0 / math.radians(s_h)] for s_t, s_h in map(sigmas, used)])
++    meas = np.array([[e.meas[0], e.meas[1], math.radians(e.meas[2])] for e in used])
++
++    def node(params: NDArray[np.float64], k: int) -> tuple[float, float, float]:
++        if k == fixed:
++            return fixed_pose[0], fixed_pose[1], math.radians(fixed_pose[2])
++        n = index[k] * 3
++        return params[n], params[n + 1], params[n + 2]
++
++    def residuals(params: NDArray[np.float64]) -> NDArray[np.float64]:
++        out = np.empty((len(used), 3))
++        for row, e in enumerate(used):
++            xi, yi, hi = node(params, e.i)
++            xj, yj, hj = node(params, e.j)
++            dx, dy = xj - xi, yj - yi
++            r = dx * math.cos(hi) - dy * math.sin(hi)
++            f = dx * math.sin(hi) + dy * math.cos(hi)
++            dh = math.atan2(math.sin(hj - hi - meas[row, 2]), math.cos(hj - hi - meas[row, 2]))
++            out[row] = ((r - meas[row, 0]), (f - meas[row, 1]), dh)
++        return (out * weights).ravel()
++
++    sparsity = lil_matrix((len(used) * 3, len(ids) * 3), dtype=int)
++    for row, e in enumerate(used):
++        for k in (e.i, e.j):
++            if k != fixed:
++                sparsity[row * 3 : row * 3 + 3, index[k] * 3 : index[k] * 3 + 3] = 1
++
++    result = least_squares(  # noqa: E501
++        residuals, x0, jac_sparsity=sparsity, loss=loss, f_scale=f_scale, max_nfev=200
++    )
++    out = {fixed: fixed_pose}
++    for k in ids:
++        n = index[k] * 3
++        out[k] = (float(result.x[n]), float(result.x[n + 1]), wrap_deg(math.degrees(result.x[n + 2])))
++    return out
++
++
++# ---------------------------------------------------------------------------
++# Inertial helper (PhonePose) interface
++# ---------------------------------------------------------------------------
++
++
++class InertialHelper(Protocol):
++    step_count: int
++    stride_m: float
++
++    def get_pose(self, t: float) -> Pose: ...
++
++
++# ---------------------------------------------------------------------------
++# SLAM
++# ---------------------------------------------------------------------------
++
++
++@dataclass
++class SlamEvent:
++    timestamp: float
++    kind: str  # "keyframe", "loop", "reloc", "lost", "tracking"
++    detail: str
++
++
++class VisualSLAM:
++    """Keyframe visual SLAM. Call `process()` with each (or every Nth)
++    frame; `get_pose()` returns the latest pose immediately."""
++
++    def __init__(
++        self,
++        cfg: SlamConfig,
++        frame_size: tuple[int, int],
++        helper: InertialHelper | None = None,
++        map_path: str | Path | None = None,
++        new_map: bool = False,
++        log: Callable[[str], None] = print,
++    ) -> None:
++        self.cfg = cfg
++        self.frame_w, self.frame_h = frame_size
++        self.scale = cfg.image_width / float(self.frame_w)
++        self.work_size = (cfg.image_width, int(round(self.frame_h * self.scale)))
++        self.K = camera_matrix(cfg, self.frame_w, self.frame_h)
++        self.extractor = FeatureExtractor(cfg)
++        self.estimator = MotionEstimator(cfg, self.K)
++        self.helper = helper
++        self.map_path = Path(map_path) if map_path is not None else None
++        self._log = log
++
++        self.map_id = uuid.uuid4().hex[:8]
++        self.keyframes: dict[int, Keyframe] = {}
++        self.edges: list[Edge] = []
++        self.next_kf_id = 0
++        self.first_kf_id: int | None = None
++
++        self.state = INIT
++        self.ref: Keyframe | None = None
++        self.ref_rel = (0.0, 0.0, 0.0)  # current pose relative to ref
++        self.pose_xyh = (0.0, 0.0, 0.0)
++        self.timestamp = 0.0
++        self.valid = False
++        self.lost_count = 0
++        self.frames_processed = 0
++        self.dist_since_correction = 0.0
++        self.loop_closures = 0
++        self.relocalizations = 0
++        self.map_version = 0  # bumped after every pose-graph optimization
++        self.kf_since_save = 0
++        self.events: list[SlamEvent] = []
++        self.last_inliers = 0
++        self.loaded_keyframes = 0
++        self._clouds: dict[int, Any] = {}
++
++        # phone frame -> map frame alignment (heading offset + anchor points)
++        self._align: tuple[float, tuple[float, float], tuple[float, float, float]] | None = None
++        self._last_odometer = 0.0
++        self._last_time: float | None = None
++
++        if self.map_path is not None and self.map_path.exists() and not new_map:
++            self.load_map(self.map_path)
++            if self.keyframes:
++                self.state = RELOCALIZING
++                log(
++                    f"SLAM | loaded map {self.map_path} ({len(self.keyframes)} keyframes); "
++                    "relocalizing - start where an earlier walk passed"
++                )
++
++    # -- helper (phone) access -----------------------------------------
++
++    def _helper_pose(self, t: float) -> Pose | None:
++        if self.helper is None:
++            return None
++        pose = self.helper.get_pose(t)
++        return pose if pose.valid else None
++
++    def _odometer(self, t: float, moving: bool) -> float:
++        """Metres walked: phone steps, or assumed speed while moving."""
++        if self.helper is not None:
++            return self.helper.step_count * self.helper.stride_m
++        if self._last_time is not None and moving:
++            self._last_odometer += self.cfg.assumed_speed_m_s * max(t - self._last_time, 0.0)
++        return self._last_odometer
++
++    def _set_alignment(self, t: float) -> None:
++        hp = self._helper_pose(t)
++        if hp is None:
++            return
++        offset = wrap_deg(self.pose_xyh[2] - hp.heading_deg)
++        self._align = (offset, (hp.x, hp.y), self.pose_xyh)
++
++    def _phone_to_map(self, hp: Pose) -> tuple[float, float, float] | None:
++        if self._align is None:
++            return None
++        offset, (px, py), (mx, my, _mh) = self._align
++        o = math.radians(offset)
++        dx, dy = hp.x - px, hp.y - py
++        return (
++            mx + dx * math.cos(o) + dy * math.sin(o),
++            my - dx * math.sin(o) + dy * math.cos(o),
++            wrap_deg(hp.heading_deg + offset),
++        )
++
++    def _fuse_heading(self, heading: float, t: float) -> float:
++        hp = self._helper_pose(t)
++        if hp is None or self._align is None:
++            return heading
++        phone_h = wrap_deg(hp.heading_deg + self._align[0])
++        return wrap_deg(heading + self.cfg.heading_phone_weight * wrap_deg(phone_h - heading))
++
++    # -- public API -----------------------------------------------------
++
++    def get_pose(self, t: float) -> Pose:
++        x, y, h = self.pose_xyh
++        return Pose(x=x, y=y, heading_deg=h, timestamp=t, valid=self.valid)
++
++    def process(
++        self,
++        image: NDArray[np.uint8],
++        timestamp: float,
++        mask_boxes: Iterable[Sequence[float]] = (),
++    ) -> Pose:
++        """Track one frame. `mask_boxes` are (x1, y1, x2, y2) in ORIGINAL
++        frame pixels (dynamic YOLO boxes) whose features are ignored."""
++        gray = image if image.ndim == 2 else cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
++        if gray.shape[1] != self.work_size[0]:
++            gray = cv2.resize(gray, self.work_size, interpolation=cv2.INTER_AREA)
++        boxes = [tuple(v * self.scale for v in box) for box in mask_boxes]
++        feats = self.extractor.extract(gray, boxes)
++        self.timestamp = timestamp
++        self.frames_processed += 1
++
++        if self.state == INIT:
++            self._start_map(feats, timestamp)
++        elif self.state == RELOCALIZING:
++            relocalized = False
++            if self.frames_processed % max(1, self.cfg.reloc_every_n) == 0:
++                relocalized = self._try_relocalize(feats, timestamp, link_from=None)
++            if not relocalized:
++                self.valid = False
++        elif self.state == LOST:
++            self._process_lost(feats, timestamp)
++        else:
++            self._track(feats, timestamp)
++
++        self._last_time = timestamp
++        return self.get_pose(timestamp)
++
++    # -- states -----------------------------------------------------------
++
++    def _start_map(self, feats: FrameFeatures, t: float) -> None:
++        if len(feats.keypoints) < self.cfg.min_inliers:
++            self.valid = False
++            return
++        self.pose_xyh = (0.0, 0.0, 0.0)
++        kf = self._add_keyframe(feats, t, self.pose_xyh, link=None)
++        self.first_kf_id = kf.kf_id
++        self.state = TRACKING
++        self.valid = True
++        self._set_alignment(t)
++        self._event(t, "tracking", "new map started at (0, 0), heading 0")
++
++    def _track(self, feats: FrameFeatures, t: float) -> None:
++        assert self.ref is not None
++        est = self.estimator.estimate(self.ref.features, feats, self.cfg.min_inliers)
++        if est is None:
++            self.lost_count += 1
++            self.last_inliers = 0
++            self._dead_reckon(t)
++            if self.lost_count >= self.cfg.lost_frames:
++                self.state = LOST
++                self._event(t, "lost", "visual tracking lost; using phone dead reckoning"
++                            if self.helper else "visual tracking lost; pose invalid")
++            return
++        self.lost_count = 0
++        self.last_inliers = est.inliers
++
++        moving = not est.rotation_only
++        odo = self._odometer(t, moving)
++        distance = max(odo - self.ref.odometer_m, 0.0)
++        dr, df = self._direction(est)
++        rel = (distance * dr, distance * df, est.dyaw_deg)
++        raw = compose(self.ref.pose, *rel)
++        heading = self._fuse_heading(raw[2], t)
++        self.pose_xyh = (raw[0], raw[1], heading)
++        self.ref_rel = relative(self.ref.pose, self.pose_xyh)
++        self.valid = True
++
++        if (
++            est.inliers < self.cfg.kf_min_inliers
++            or est.trans_parallax_px > self.cfg.kf_parallax_px
++            or abs(est.dyaw_deg) > self.cfg.kf_yaw_deg
++            or distance > self.cfg.kf_max_distance_m
++        ):
++            prev = self.ref
++            kf = self._add_keyframe(feats, t, self.pose_xyh, link=prev)
++            self.dist_since_correction += math.hypot(*relative(prev.pose, kf.pose)[:2])
++            self._detect_loop(kf)
++        self._set_alignment(t)
++
++    def _direction(self, est: MotionEstimate) -> tuple[float, float]:
++        """Walking direction in the reference frame. Falls back to the
++        current camera forward when the visual direction is unreliable or
++        implausibly sideways (people walk forward)."""
++        fwd = (math.sin(math.radians(est.dyaw_deg)), math.cos(math.radians(est.dyaw_deg)))
++        if (
++            est.rotation_only
++            or est.trans_parallax_px < self.cfg.dir_min_parallax_px
++            or (est.dir_right == 0.0 and est.dir_forward == 0.0)
++        ):
++            return fwd
++        angle = math.degrees(math.atan2(est.dir_right, est.dir_forward)) - est.dyaw_deg
++        if abs(wrap_deg(angle)) > self.cfg.max_lateral_deg:
++            return fwd
++        return est.dir_right, est.dir_forward
++
++    def _dead_reckon(self, t: float) -> None:
++        hp = self._helper_pose(t)
++        mapped = self._phone_to_map(hp) if hp is not None else None
++        if mapped is None:
++            self.valid = False
++            return
++        self.pose_xyh = mapped
++        self.valid = True
++
++    def _process_lost(self, feats: FrameFeatures, t: float) -> None:
++        self._dead_reckon(t)
++        assert self.ref is not None
++        est = self.estimator.estimate(self.ref.features, feats, self.cfg.min_inliers)
++        if est is not None:
++            # Re-acquired the current keyframe: continue from it.
++            self.state = TRACKING
++            self.lost_count = 0
++            self._event(t, "tracking", f"re-acquired keyframe {self.ref.kf_id}")
++            self._track(feats, t)
++            return
++        if self.frames_processed % max(1, self.cfg.reloc_every_n) == 0:
++            self._try_relocalize(feats, t, link_from=self.ref if self.valid else None)
++
++    def _try_relocalize(self, feats: FrameFeatures, t: float, link_from: Keyframe | None) -> bool:
++        candidates = sorted(
++            self.keyframes.values(),
++            key=lambda kf: thumb_ncc(kf.features.thumb, feats.thumb),
++            reverse=True,
++        )[: self.cfg.reloc_candidates]
++        best: tuple[Keyframe, MotionEstimate] | None = None
++        for kf in candidates:
++            est = self.estimator.estimate(kf.features, feats, self.cfg.reloc_min_inliers)
++            if est is not None and (best is None or est.inliers > best[1].inliers):
++                best = (kf, est)
++        if best is None:
++            return False
++        kf, est = best
++        rel, sigma = self._loop_measurement(kf, feats, est, self.cfg.reloc_min_inliers)
++        self.pose_xyh = compose(kf.pose, *rel)
++        new = self._add_keyframe(feats, t, self.pose_xyh, link=None)
++        self.edges.append(Edge(kf.kf_id, new.kf_id, rel, EDGE_RELOC, sigma))
++        if link_from is not None and link_from.kf_id != kf.kf_id and self.helper is not None:
++            # Weak dead-reckoning edge keeps the trajectory continuous.
++            self.edges.append(Edge(link_from.kf_id, new.kf_id, relative(link_from.pose, new.pose), EDGE_LOOP))
++        self.state = TRACKING
++        self.valid = True
++        self.lost_count = 0
++        self.relocalizations += 1
++        self._set_alignment(t)
++        self._event(t, "reloc", f"relocalized to keyframe {kf.kf_id} ({est.inliers} inliers)")
++        if link_from is not None:
++            self._optimize()
++        return True
++
++    # -- map building -------------------------------------------------------
++
++    def _add_keyframe(
++        self,
++        feats: FrameFeatures,
++        t: float,
++        pose: tuple[float, float, float],
++        link: Keyframe | None,
++    ) -> Keyframe:
++        # Store the strongest features only (map size); bucketing already spread them.
++        keep = min(len(feats.keypoints), self.cfg.map_features)
++        stored = FrameFeatures(feats.keypoints[:keep].copy(), feats.descriptors[:keep].copy(), feats.thumb)
++        moving_odo = self._odometer(t, False) if self.helper is not None else self._last_odometer
++        kf = Keyframe(self.next_kf_id, t, pose, stored, moving_odo)
++        self.next_kf_id += 1
++        self.keyframes[kf.kf_id] = kf
++        if link is not None:
++            self.edges.append(Edge(link.kf_id, kf.kf_id, relative(link.pose, kf.pose), EDGE_ODOM))
++        self.ref = kf
++        self.ref_rel = (0.0, 0.0, 0.0)
++        self.kf_since_save += 1
++        if self.map_path is not None and self.kf_since_save >= self.cfg.save_every_kf:
++            self.save_map(self.map_path)
++        return kf
++
++    def _detect_loop(self, kf: Keyframe) -> None:
++        radius = self.cfg.loop_radius_m + self.cfg.loop_radius_per_m * self.dist_since_correction
++        recent = {k for k in self.keyframes if k > kf.kf_id - self.cfg.loop_min_gap}
++        candidates = []
++        for other in self.keyframes.values():
++            if other.kf_id in recent:
++                continue
++            if math.hypot(other.pose[0] - kf.pose[0], other.pose[1] - kf.pose[1]) > radius:
++                continue
++            ncc = thumb_ncc(other.features.thumb, kf.features.thumb)
++            if ncc >= self.cfg.loop_min_ncc:
++                candidates.append((ncc, other))
++        candidates.sort(key=lambda c: c[0], reverse=True)
++        for _ncc, other in candidates[: self.cfg.loop_candidates]:
++            est = self.estimator.estimate(other.features, kf.features, self.cfg.loop_min_inliers)
++            if est is None:
++                continue
++            rel, sigma = self._loop_measurement(other, kf.features, est, self.cfg.loop_min_inliers)
++            # Loops need a metric measurement: a rotation-only loop edge
++            # would wrongly pull two keyframes metres apart together.
++            if sigma != self.cfg.loop_sigma_m or math.hypot(rel[0], rel[1]) > radius:
++                continue
++            edge = Edge(other.kf_id, kf.kf_id, rel, EDGE_LOOP, sigma)
++            before = kf.pose
++            if not self._optimize(new_edge=edge):
++                self._event(kf.timestamp, "loop_rejected",
++                            f"loop kf {kf.kf_id} -> kf {other.kf_id} rejected (inconsistent with odometry)")
++                continue
++            self.loop_closures += 1
++            moved = math.hypot(kf.pose[0] - before[0], kf.pose[1] - before[1])
++            self._event(
++                kf.timestamp,
++                "loop",
++                f"loop closure kf {kf.kf_id} -> kf {other.kf_id} ({est.inliers} inliers, "
++                f"{'metric' if sigma == self.cfg.loop_sigma_m else 'rotation-only'}), "
++                f"map corrected by {moved:.2f} m",
++            )
++            self.dist_since_correction = 0.0
++            return
++
++    def _cloud(self, kf: Keyframe) -> Any:
++        """Triangulated 3D points of `kf`, using its best odometry neighbour."""
++        if kf.kf_id in self._clouds:
++            return self._clouds[kf.kf_id]
++        best = None
++        for e in self.edges:
++            if e.kind != EDGE_ODOM or kf.kf_id not in (e.i, e.j):
++                continue
++            other = self.keyframes.get(e.j if e.i == kf.kf_id else e.i)
++            if other is None:
++                continue
++            baseline = math.hypot(other.pose[0] - kf.pose[0], other.pose[1] - kf.pose[1])
++            if 0.25 <= baseline <= 3.0 and (best is None or baseline > best[0]):
++                best = (baseline, other)
++        cloud = None
++        if best is not None:
++            cloud = self.estimator.triangulate(kf.features, best[1].features, best[0])
++        self._clouds[kf.kf_id] = cloud
++        return cloud
++
++    def _loop_measurement(
++        self, kf: Keyframe, feats: FrameFeatures, est: MotionEstimate, min_inliers: int
++    ) -> tuple[tuple[float, float, float], float]:
++        """Relative pose of `feats` in kf's frame for a loop/reloc edge.
++
++        Metric translation via PnP on kf's triangulated points when
++        possible; otherwise rotation only, with a loose translation sigma.
++        """
++        cloud = self._cloud(kf)
++        if cloud is not None:
++            result = self.estimator.metric_relative(kf.features, cloud, feats, min_inliers)
++            if result is not None:
++                rel, _n = result
++                return rel, self.cfg.loop_sigma_m
++        return (0.0, 0.0, est.dyaw_deg), self.cfg.loop_sigma_unscaled_m
++
++    def _sigmas(self, edge: Edge) -> tuple[float, float]:
++        if edge.sigma_m > 0:
++            return edge.sigma_m, self.cfg.loop_sigma_deg
++        if edge.kind == EDGE_ODOM:
++            dist = math.hypot(edge.meas[0], edge.meas[1])
++            return self.cfg.odom_sigma_m + self.cfg.odom_sigma_per_m * dist, self.cfg.odom_sigma_deg
++        return self.cfg.loop_sigma_m, self.cfg.loop_sigma_deg
++
++    def _optimize(self, new_edge: Edge | None = None) -> bool:
++        """Optimize the pose graph. With `new_edge` (a candidate loop), the
++        edge is kept only if afterwards no odometry edge is stretched by
++        more than `loop_max_odom_sigma` (a false loop would tear the
++        odometry apart); otherwise it is dropped and nothing changes."""
++        if self.first_kf_id is None:
++            return False
++        edges = self.edges + ([new_edge] if new_edge is not None else [])
++        poses = {k: kf.pose for k, kf in self.keyframes.items()}
++        new = optimize_pose_graph(
++            poses, edges, self.first_kf_id, self._sigmas, self.cfg.graph_loss, self.cfg.graph_f_scale
++        )
++        if new_edge is not None:
++            worst = max(
++                (edge_residual(new, e, *self._sigmas(e)) for e in self.edges if e.kind == EDGE_ODOM),
++                default=0.0,
++            )
++            if worst > self.cfg.loop_max_odom_sigma:
++                return False
++            self.edges.append(new_edge)
++        for k, p in new.items():
++            self.keyframes[k].pose = p
++        if self.ref is not None:
++            self.pose_xyh = compose(self.ref.pose, *self.ref_rel)
++        self.map_version += 1
++        self._clouds.clear()
++        self._set_alignment(self.timestamp)
++        return True
++
++    # -- hazard anchors -------------------------------------------------------
++
++    def anchor_id(self, kf_id: int) -> str:
++        return f"{self.map_id}:{kf_id}"
++
++    def current_anchor(self) -> tuple[str, tuple[float, float, float]] | None:
++        """Anchor id + pose of the keyframe the camera is tracking now."""
++        if self.ref is None or not self.valid or self.state != TRACKING:
++            return None
++        return self.anchor_id(self.ref.kf_id), self.ref.pose
++
++    def anchor_poses(self) -> dict[str, tuple[float, float, float]]:
++        return {self.anchor_id(k): kf.pose for k, kf in self.keyframes.items()}
++
++    # -- persistence ------------------------------------------------------------
++
++    def save_map(self, path: str | Path) -> None:
++        path = Path(path)
++        path.parent.mkdir(parents=True, exist_ok=True)
++        kfs = sorted(self.keyframes.values(), key=lambda kf: kf.kf_id)
++        counts = np.array([len(kf.features.keypoints) for kf in kfs], dtype=np.int64)
++        np.savez_compressed(
++            path if path.suffix == ".npz" else path.with_suffix(path.suffix + ".npz"),
++            map_id=np.array(self.map_id),
++            image_width=np.array(self.cfg.image_width),
++            K=self.K,
++            first_kf_id=np.array(-1 if self.first_kf_id is None else self.first_kf_id),
++            next_kf_id=np.array(self.next_kf_id),
++            kf_ids=np.array([kf.kf_id for kf in kfs], dtype=np.int64),
++            kf_times=np.array([kf.timestamp for kf in kfs], dtype=np.float64),
++            kf_poses=np.array([kf.pose for kf in kfs], dtype=np.float64).reshape(-1, 3),
++            kf_thumbs=np.array([kf.features.thumb for kf in kfs], dtype=np.float32).reshape(len(kfs), -1),
++            kf_counts=counts,
++            kp=np.concatenate([kf.features.keypoints for kf in kfs]) if kfs else np.zeros((0, 2), np.float32),
++            des=np.concatenate([kf.features.descriptors for kf in kfs]) if kfs else np.zeros((0, 32), np.uint8),
++            edges=np.array([(e.i, e.j, e.kind) for e in self.edges], dtype=np.int64).reshape(-1, 3),
++            edge_meas=np.array([e.meas for e in self.edges], dtype=np.float64).reshape(-1, 3),
++            edge_sigma=np.array([e.sigma_m for e in self.edges], dtype=np.float64),
++        )
++        self.kf_since_save = 0
++
++    def load_map(self, path: str | Path) -> None:
++        path = Path(path)
++        with np.load(path, allow_pickle=False) as data:
++            if int(data["image_width"]) != self.cfg.image_width:
++                raise ValueError(
++                    f"Map {path} was built at slam.image_width={int(data['image_width'])}, "
++                    f"config has {self.cfg.image_width}. Use the same value or --slam-new-map."
++                )
++            self.map_id = str(data["map_id"])
++            first = int(data["first_kf_id"])
++            self.first_kf_id = None if first < 0 else first
++            self.next_kf_id = int(data["next_kf_id"])
++            offsets = np.concatenate([[0], np.cumsum(data["kf_counts"])])
++            for n, kf_id in enumerate(data["kf_ids"]):
++                a, b = int(offsets[n]), int(offsets[n + 1])
++                feats = FrameFeatures(
++                    data["kp"][a:b].astype(np.float32),
++                    data["des"][a:b].astype(np.uint8),
++                    data["kf_thumbs"][n].astype(np.float32),
++                )
++                pose = tuple(float(v) for v in data["kf_poses"][n])
++                self.keyframes[int(kf_id)] = Keyframe(int(kf_id), float(data["kf_times"][n]), pose, feats)  # type: ignore[arg-type]
++            sig = data["edge_sigma"] if "edge_sigma" in data else np.zeros(len(data["edges"]))
++            self.edges = [
++                Edge(int(i), int(j), tuple(float(v) for v in m), int(kind), float(sg))  # type: ignore[arg-type]
++                for (i, j, kind), m, sg in zip(data["edges"], data["edge_meas"], sig)
++            ]
++        self.loaded_keyframes = len(self.keyframes)
++
++    # -- misc ---------------------------------------------------------------------
++
++    def _event(self, t: float, kind: str, detail: str) -> None:
++        self.events.append(SlamEvent(t, kind, detail))
++        self._log(f"SLAM | {detail}")
++
++    def loop_edges(self) -> list[tuple[tuple[float, float], tuple[float, float]]]:
++        out = []
++        for e in self.edges:
++            if e.kind != EDGE_ODOM and e.i in self.keyframes and e.j in self.keyframes:
++                a, b = self.keyframes[e.i].pose, self.keyframes[e.j].pose
++                out.append(((a[0], a[1]), (b[0], b[1])))
++        return out
++
++
++def boxes_from_yolo_result(result: Any, labels: Iterable[str]) -> list[tuple[float, float, float, float]]:
++    """(x1, y1, x2, y2) of detections whose class name is in `labels`."""
++    wanted = set(labels)
++    if result is None or getattr(result, "boxes", None) is None:
++        return []
++    names = getattr(result, "names", {}) or {}
++    boxes = []
++    for box in result.boxes:
++        cls_id = int(box.cls.item())
++        if names.get(cls_id, str(cls_id)) in wanted:
++            x1, y1, x2, y2 = (float(v) for v in box.xyxy[0].tolist())
++            boxes.append((x1, y1, x2, y2))
++    return boxes
+diff --git a/scripts/manual/calibrate_camera.py b/scripts/manual/calibrate_camera.py
+new file mode 100644
+index 0000000..08f3c96
+--- /dev/null
++++ b/scripts/manual/calibrate_camera.py
+@@ -0,0 +1,106 @@
++"""Calibrate the phone camera for the visual SLAM (manual, needs a camera).
++
++Print a chessboard (e.g. 9 x 6 inner corners, search "opencv chessboard
++pattern"), measure one square, and either:
++
++  # live from the IP Webcam stream: press SPACE to grab a view, Q to finish
++  python scripts/manual/calibrate_camera.py --source http://<PHONE_IP>:8080/video
++
++  # or from a folder of photos taken at the SAME resolution as the stream
++  python scripts/manual/calibrate_camera.py --images calib_photos
++
++Grab 15-25 views with the board at different positions, distances and
++tilts, covering the corners of the image. The script prints the `slam:`
++values to paste into config.yaml (fx, fy, cx, cy, calib_width).
++"""
++
++from __future__ import annotations
++
++import argparse
++from pathlib import Path
++
++import cv2
++import numpy as np
++
++
++def find_corners(gray, pattern):
++    found, corners = cv2.findChessboardCorners(gray, pattern, cv2.CALIB_CB_ADAPTIVE_THRESH + cv2.CALIB_CB_NORMALIZE_IMAGE)
++    if not found:
++        return None
++    return cv2.cornerSubPix(
++        gray, corners, (11, 11), (-1, -1), (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
++    )
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    parser.add_argument("--source", default=None, help="stream URL or camera index")
++    parser.add_argument("--images", type=Path, default=None, help="folder of chessboard photos")
++    parser.add_argument("--cols", type=int, default=9, help="inner corners per row")
++    parser.add_argument("--rows", type=int, default=6, help="inner corners per column")
++    parser.add_argument("--square-mm", type=float, default=25.0)
++    args = parser.parse_args()
++    if (args.source is None) == (args.images is None):
++        raise SystemExit("Give exactly one of --source or --images.")
++
++    pattern = (args.cols, args.rows)
++    board = np.zeros((args.cols * args.rows, 3), np.float32)
++    board[:, :2] = np.mgrid[0 : args.cols, 0 : args.rows].T.reshape(-1, 2) * args.square_mm / 1000.0
++    obj_points, img_points, size = [], [], None
++
++    if args.images is not None:
++        for path in sorted(args.images.iterdir()):
++            image = cv2.imread(str(path))
++            if image is None:
++                continue
++            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
++            corners = find_corners(gray, pattern)
++            print(f"{path.name}: {'ok' if corners is not None else 'board not found'}")
++            if corners is not None:
++                obj_points.append(board)
++                img_points.append(corners)
++                size = gray.shape[::-1]
++    else:
++        source = int(args.source) if args.source.isdigit() else args.source
++        cap = cv2.VideoCapture(source)
++        if not cap.isOpened():
++            raise SystemExit(f"Could not open {args.source}")
++        print("SPACE = grab view, Q = finish")
++        while True:
++            ok, frame = cap.read()
++            if not ok:
++                continue
++            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
++            corners = find_corners(gray, pattern)
++            view = frame.copy()
++            if corners is not None:
++                cv2.drawChessboardCorners(view, pattern, corners, True)
++            cv2.putText(view, f"views: {len(img_points)}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
++            cv2.imshow("calibration", view)
++            key = cv2.waitKey(1) & 0xFF
++            if key == ord(" ") and corners is not None:
++                obj_points.append(board)
++                img_points.append(corners)
++                size = gray.shape[::-1]
++            elif key == ord("q"):
++                break
++        cap.release()
++        cv2.destroyAllWindows()
++
++    if len(img_points) < 8:
++        raise SystemExit(f"Only {len(img_points)} usable views; take at least 8 (15+ is better).")
++    rms, K, dist, _r, _t = cv2.calibrateCamera(obj_points, img_points, size, None, None)
++    print(f"\nRMS reprojection error: {rms:.3f} px (below ~0.5 is good)")
++    print(f"Frame size: {size[0]} x {size[1]}\n")
++    print("Paste into config.yaml under slam:")
++    print(f"  fx: {K[0, 0]:.2f}")
++    print(f"  fy: {K[1, 1]:.2f}")
++    print(f"  cx: {K[0, 2]:.2f}")
++    print(f"  cy: {K[1, 2]:.2f}")
++    print(f"  calib_width: {size[0]}")
++    hfov = 2 * np.degrees(np.arctan(size[0] / (2 * K[0, 0])))
++    print(f"\n(horizontal FOV = {hfov:.1f} deg; distortion {np.round(dist.ravel()[:5], 3).tolist()})")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/test_vslam.py b/tests/test_vslam.py
+new file mode 100644
+index 0000000..6eff8a8
+--- /dev/null
++++ b/tests/test_vslam.py
+@@ -0,0 +1,342 @@
++"""Visual SLAM tests: conventions, pose graph, map persistence,
++relocalization, hazard re-anchoring and an end-to-end synthetic loop.
++No camera, phone, GPU or audio device needed (synthetic rendered frames).
++"""
++
++import math
++import sqlite3
++
++import numpy as np
++import pytest
++
++from navigation.config import load_config
++from navigation.memory import RouteMemory
++from navigation.models import Pose
++from navigation.slam_eval import ate_rmse, loop_drift, project_to_plane, umeyama
++from navigation.synthetic_scene import FakePhone, Room, render, square_walk
++from navigation.vslam import (
++    EDGE_LOOP,
++    EDGE_ODOM,
++    LOST,
++    RELOCALIZING,
++    TRACKING,
++    Edge,
++    SlamConfig,
++    VisualSLAM,
++    boxes_from_yolo_result,
++    camera_matrix,
++    compose,
++    ground_motion,
++    optimize_pose_graph,
++    relative,
++)
++
++SIZE = (640, 360)
++
++
++@pytest.fixture(scope="module")
++def room():
++    return Room()
++
++
++@pytest.fixture(scope="module")
++def K():
++    return camera_matrix(SlamConfig(), *SIZE)
++
++
++def ry(theta_deg):
++    c, s = math.cos(math.radians(theta_deg)), math.sin(math.radians(theta_deg))
++    return np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]])
++
++
++def opencv_motion(yaw_deg, centre):
++    """(R, t) as recoverPose returns them for a camera that turned right by
++    yaw_deg and moved to `centre` (in the reference camera frame)."""
++    Rc = ry(yaw_deg)
++    return Rc.T, -Rc.T @ np.asarray(centre, float)
++
++
++# -- conventions ---------------------------------------------------------
++
++
++def test_compose_follows_claude_md_heading_convention():
++    # heading 90 = facing +x: one metre forward goes to +x
++    x, y, h = compose((0.0, 0.0, 90.0), 0.0, 1.0, 0.0)
++    assert x == pytest.approx(1.0) and y == pytest.approx(0.0, abs=1e-9)
++    # heading 0: forward is +y, right is +x
++    x, y, _ = compose((0.0, 0.0, 0.0), 1.0, 2.0, 0.0)
++    assert (x, y) == pytest.approx((1.0, 2.0))
++
++
++def test_relative_inverts_compose():
++    base = (2.0, -1.0, 37.0)
++    rel = (0.4, 1.3, -12.0)
++    assert relative(base, compose(base, *rel)) == pytest.approx(rel)
++
++
++def test_ground_motion_turn_right_increases_heading():
++    dyaw, _r, _f = ground_motion(*opencv_motion(10.0, [0, 0, 0]))
++    assert dyaw == pytest.approx(10.0)
++
++
++def test_ground_motion_forward_and_right_translation():
++    dyaw, r, f = ground_motion(*opencv_motion(0.0, [0, 0, 2.0]))
++    assert (dyaw, r, f) == pytest.approx((0.0, 0.0, 1.0), abs=1e-9)
++    _d, r, f = ground_motion(*opencv_motion(0.0, [1.0, 0, 0]))
++    assert (r, f) == pytest.approx((1.0, 0.0), abs=1e-9)
++
++
++def test_ground_motion_removes_camera_pitch():
++    # Camera tilted down 20 deg walking level-forward: in its own frame the
++    # motion has a "up" (negative y) component; ground motion is forward.
++    pitch = 20.0
++    p = math.radians(pitch)
++    centre_cam = np.array([0.0, -math.sin(p), math.cos(p)])
++    _d, r, f = ground_motion(np.eye(3), -centre_cam, pitch_deg=pitch)
++    assert (r, f) == pytest.approx((0.0, 1.0), abs=1e-9)
++
++
++# -- tracking on rendered frames ---------------------------------------------
++
++
++def run(slam, room, K, poses, t0=0.0, dt=0.1, phone=None):
++    out = []
++    for n, (x, y, h) in enumerate(poses):
++        t = t0 + n * dt
++        if phone is not None:
++            phone.update(t, x, y, h)
++        out.append(slam.process(render(room, x, y, h, K, SIZE), t))
++    return out
++
++
++def test_walking_forward_increases_y_and_turning_right_increases_heading(room, K):
++    slam = VisualSLAM(SlamConfig(), SIZE, log=lambda _m: None)
++    forward = [(-4.0, -4.0 + 0.1 * n, 0.0) for n in range(25)]
++    turn = [(-4.0, -1.6, 3.0 * n) for n in range(1, 16)]
++    poses = run(slam, room, K, forward + turn)
++    assert slam.state == TRACKING
++    assert poses[24].y > 1.0 and abs(poses[24].x) < 0.5
++    assert poses[-1].heading_deg == pytest.approx(45.0, abs=5.0)
++
++
++def test_scale_comes_from_phone_steps(room, K):
++    phone = FakePhone(stride_m=0.7, true_stride_m=0.7, drift_deg_s=0.0, noise_deg=0.0)
++    slam = VisualSLAM(SlamConfig(), SIZE, helper=phone, log=lambda _m: None)
++    poses = run(slam, room, K, [(-4.0, -4.0 + 0.1 * n, 0.0) for n in range(36)], phone=phone)
++    # walked 3.5 m = 5 steps of 0.7 m exactly
++    assert phone.step_count == 5
++    assert poses[-1].y == pytest.approx(3.5, abs=0.15)
++
++
++def test_dynamic_boxes_mask_features(room, K):
++    slam = VisualSLAM(SlamConfig(), SIZE, log=lambda _m: None)
++    image = render(room, -4.0, -4.0, 0.0, K, SIZE)
++    full = slam.extractor.extract(image)
++    masked = slam.extractor.extract(image, [(0, 0, 320, 360)])
++    assert len(masked.keypoints) > 0
++    assert np.all(masked.keypoints[:, 0] > 315)
++    assert len(full.keypoints) > len(masked.keypoints)
++
++
++def test_lost_tracking_falls_back_to_phone_or_goes_invalid(room, K):
++    blank = np.full((SIZE[1], SIZE[0]), 90, np.uint8)
++    cfg = SlamConfig(lost_frames=2)
++    for helper in (None, FakePhone()):
++        slam = VisualSLAM(cfg, SIZE, helper=helper, log=lambda _m: None)
++        slam.process(render(room, -4.0, -4.0, 0.0, K, SIZE), 0.0)
++        for n in range(4):
++            pose = slam.process(blank, 0.1 * (n + 1))
++        assert slam.state == LOST
++        assert pose.valid is (helper is not None)
++
++
++# -- pose graph -----------------------------------------------------------------
++
++
++def test_pose_graph_closes_a_drifted_square_loop():
++    true = [(0, 0, 0), (0, 4, 0), (0, 4, 90), (4, 4, 90), (4, 4, 180), (4, 0, 180), (4, 0, 270), (0, 0, 270)]
++    true = [(x, y, ((h + 180) % 360) - 180) for x, y, h in true]
++    edges = []
++    drifted = {0: true[0]}
++    for k in range(1, len(true)):
++        r, f, dh = relative(true[k - 1], true[k])
++        meas = (r, f * 0.95, dh + 2.0)  # 5 % scale error, 2 deg yaw error per step
++        edges.append(Edge(k - 1, k, meas, EDGE_ODOM))
++        drifted[k] = compose(drifted[k - 1], *meas)
++    loop = Edge(0, len(true) - 1, relative(true[0], true[-1]), EDGE_LOOP)
++    before = math.dist(drifted[7][:2], true[7][:2])
++    out = optimize_pose_graph(
++        drifted, edges + [loop], 0, lambda e: (0.2, 2.0) if e.kind == EDGE_ODOM else (0.1, 1.0)
++    )
++    after = math.dist(out[7][:2], true[7][:2])
++    assert before > 0.5 and after < before / 4
++
++
++def test_inconsistent_loop_is_rejected(room, K):
++    slam = VisualSLAM(SlamConfig(), SIZE, log=lambda _m: None)
++    run(slam, room, K, [(-4.0, -4.0 + 0.1 * n, 0.0) for n in range(40)])
++    last = max(slam.keyframes)
++    assert last >= 2
++    poses_before = {k: kf.pose for k, kf in slam.keyframes.items()}
++    # Claim the last keyframe is 10 m to the side of the first: impossible.
++    bad = Edge(0, last, (10.0, 0.0, 0.0), EDGE_LOOP, 0.2)
++    assert slam._optimize(new_edge=bad) is False
++    assert bad not in slam.edges
++    assert {k: kf.pose for k, kf in slam.keyframes.items()} == poses_before
++
++
++# -- persistence + relocalization ---------------------------------------------------
++
++
++def test_map_round_trip_and_relocalization(room, K, tmp_path):
++    path = tmp_path / "map.npz"
++    first = VisualSLAM(SlamConfig(), SIZE, map_path=path, log=lambda _m: None)
++    run(first, room, K, [(-4.0, -4.0 + 0.1 * n, 0.0) for n in range(30)])
++    first.save_map(path)
++
++    second = VisualSLAM(SlamConfig(reloc_every_n=1), SIZE, map_path=path, log=lambda _m: None)
++    assert second.state == RELOCALIZING
++    assert len(second.keyframes) == len(first.keyframes)
++    assert second.map_id == first.map_id
++    pose = second.process(render(room, -4.0, -4.0 + 1.0, 0.0, K, SIZE), 100.0)
++    assert second.state == TRACKING and pose.valid
++    # Same world frame as the first run: about 1 m forward of its start.
++    assert pose.y == pytest.approx(1.0, abs=0.4)
++    assert abs(pose.x) < 0.4
++    assert second.relocalizations == 1
++
++
++def test_relocalizing_pose_is_invalid_until_recognized(room, K, tmp_path):
++    path = tmp_path / "map.npz"
++    first = VisualSLAM(SlamConfig(), SIZE, map_path=path, log=lambda _m: None)
++    run(first, room, K, [(-4.0, -4.0 + 0.1 * n, 0.0) for n in range(10)])
++    first.save_map(path)
++    second = VisualSLAM(SlamConfig(reloc_every_n=1), SIZE, map_path=path, log=lambda _m: None)
++    blank = np.full((SIZE[1], SIZE[0]), 90, np.uint8)
++    assert second.process(blank, 0.0).valid is False
++    assert second.state == RELOCALIZING
++
++
++def test_new_map_flag_ignores_saved_map(room, K, tmp_path):
++    path = tmp_path / "map.npz"
++    first = VisualSLAM(SlamConfig(), SIZE, map_path=path, log=lambda _m: None)
++    run(first, room, K, [(-4.0, -4.0, 0.0)])
++    first.save_map(path)
++    fresh = VisualSLAM(SlamConfig(), SIZE, map_path=path, new_map=True, log=lambda _m: None)
++    assert fresh.state != RELOCALIZING and not fresh.keyframes
++
++
++# -- end to end ----------------------------------------------------------------------
++
++
++def test_square_loop_closure_removes_drift(room, K):
++    phone = FakePhone()  # 7 % stride error + heading drift
++    slam = VisualSLAM(SlamConfig(), SIZE, helper=phone, log=lambda _m: None)
++    walk = square_walk()
++    x0, y0 = walk[0][1], walk[0][2]
++    scale = phone.stride_m / phone.true_stride_m  # the map's metric scale
++    for t, x, y, h in walk:
++        phone.update(t, x, y, h)
++        pose = slam.process(render(room, x, y, h, K, SIZE), t)
++    assert slam.loop_closures >= 1
++    gt_end = ((walk[-1][1] - x0) * scale, (walk[-1][2] - y0) * scale)
++    assert math.dist((pose.x, pose.y), gt_end) < 0.3
++
++
++# -- hazard memory anchoring --------------------------------------------------------
++
++
++def test_anchored_hazard_moves_with_its_keyframe(tmp_path):
++    memory = RouteMemory(str(tmp_path / "m.db"))
++    kf_pose = (1.0, 2.0, 90.0)
++    right, forward = relative(kf_pose, (3.0, 2.0, 0.0))[:2]  # 2 m ahead of the keyframe
++    memory.remember("pole-1", "pole", 3.0, 2.0, 0.9, timestamp=10.0, anchor=("m:5", right, forward))
++    memory.remember("pole-2", "pole", 9.0, 9.0, 0.9, timestamp=10.0)  # unanchored
++    moved = memory.reanchor({"m:5": (1.0, 3.0, 0.0)})  # keyframe moved 1 m and turned
++    assert moved == 1
++    by_id = {h.object_id: h for h in memory.get_hazards()}
++    assert (by_id["pole-1"].world_x, by_id["pole-1"].world_y) == pytest.approx((1.0, 5.0))
++    assert (by_id["pole-2"].world_x, by_id["pole-2"].world_y) == (9.0, 9.0)
++
++
++def test_old_database_without_anchor_columns_still_loads(tmp_path):
++    db = tmp_path / "old.db"
++    with sqlite3.connect(db) as conn:
++        conn.execute(
++            """CREATE TABLE hazards (hazard_id TEXT PRIMARY KEY, object_id TEXT NOT NULL,
++            label TEXT NOT NULL, world_x REAL NOT NULL, world_y REAL NOT NULL,
++            confidence REAL NOT NULL, timestamp REAL NOT NULL,
++            decay_weight REAL NOT NULL DEFAULT 1.0, velocity_x REAL NOT NULL DEFAULT 0.0,
++            velocity_y REAL NOT NULL DEFAULT 0.0)"""
++        )
++        conn.execute("INSERT INTO hazards VALUES ('h1','pole-1','pole',1,2,0.9,5,1,0,0)")
++    memory = RouteMemory(str(db))
++    assert [h.hazard_id for h in memory.get_hazards()] == ["h1"]
++    assert memory.reanchor({"x:1": (0.0, 0.0, 0.0)}) == 0
++    memory.remember("pole-9", "pole", 5.0, 5.0, 0.9, timestamp=6.0, anchor=("x:1", 0.0, 1.0))
++    assert memory.reanchor({"x:1": (0.0, 0.0, 0.0)}) == 1
++
++
++# -- helpers ---------------------------------------------------------------------------
++
++
++class _T:
++    def __init__(self, v):
++        self.v = v
++
++    def item(self):
++        return self.v
++
++    def tolist(self):
++        return self.v
++
++
++class _Box:
++    def __init__(self, xyxy, cls):
++        self.xyxy = [_T(list(xyxy))]
++        self.cls = _T(cls)
++
++
++class _Result:
++    names = {0: "person", 1: "pole"}
++
++    def __init__(self, boxes):
++        self.boxes = boxes
++
++
++def test_boxes_from_yolo_result_keeps_only_dynamic_labels():
++    result = _Result([_Box((1, 2, 3, 4), 0), _Box((5, 6, 7, 8), 1)])
++    assert boxes_from_yolo_result(result, {"person"}) == [(1.0, 2.0, 3.0, 4.0)]
++    assert boxes_from_yolo_result(None, {"person"}) == []
++
++
++def test_umeyama_recovers_similarity_and_ate_is_zero():
++    rng = np.random.default_rng(0)
++    gt = rng.normal(size=(50, 2))
++    th = math.radians(30)
++    R = np.array([[math.cos(th), -math.sin(th)], [math.sin(th), math.cos(th)]])
++    est = (0.5 * (R @ gt.T)).T + [3.0, -1.0]
++    err, _aligned = ate_rmse(est, gt)
++    assert err == pytest.approx(0.0, abs=1e-9)
++    _R, _t, s = umeyama(est, gt)
++    assert s == pytest.approx(2.0)
++
++
++def test_project_to_plane_and_loop_drift():
++    square = np.array([[0, 0, 0], [4, 0, 0], [4, 4, 0], [0, 4, 0], [0.3, 0.4, 0]], float)
++    tilted = square @ np.array([[1, 0, 0], [0, 0.8, 0.6], [0, -0.6, 0.8]])
++    flat = project_to_plane(tilted)
++    assert flat.shape == (5, 2)
++    drift = loop_drift(square[:, :2])
++    assert drift["end_error_m"] == pytest.approx(0.5)
++    assert drift["drift_percent"] == pytest.approx(100 * 0.5 / drift["distance_m"])
++
++
++def test_slam_config_section_matches_dataclass():
++    import dataclasses
++
++    section = load_config()["slam"]
++    names = {f.name for f in dataclasses.fields(SlamConfig)}
++    assert set(section) - names == {"map_path", "process_every_n"}
++    assert names - set(section) == set()
++    assert SlamConfig.from_config(section).image_width == 640
+diff --git a/tools/eval_slam_tum.py b/tools/eval_slam_tum.py
+new file mode 100644
+index 0000000..46e4acd
+--- /dev/null
++++ b/tools/eval_slam_tum.py
+@@ -0,0 +1,169 @@
++"""Evaluate navigation/vslam.py on a TUM RGB-D sequence (RGB images only).
++
++Download a sequence from https://cvg.cit.tum.de/data/datasets/rgbd-dataset
++and unpack it. Planar sequences match our 2D ground-plane model best:
++  - fr2/pioneer_360, fr2/pioneer_slam, fr2/pioneer_slam2/3 (camera on a robot)
++  - fr3/walking_xyz, fr3/walking_halfsphere (people walking: shows masking)
++The ground truth is projected onto its best-fit plane, then the SLAM path
++is aligned with a similarity transform (Umeyama) and ATE RMSE is reported.
++
++Scale: one camera cannot measure distance. By default the metric distance
++between frames comes from the ground truth path length ("oracle step
++counter", standing in for the phone's step counter), which isolates the
++visual parts: rotation, direction, loop closure. --scale assumed uses
++slam.assumed_speed_m_s instead (no ground truth used during the run).
++
++    python tools/eval_slam_tum.py C:\\data\\rgbd_dataset_freiburg2_pioneer_slam --camera fr2
++    python tools/eval_slam_tum.py ... --out runs\\tum_pioneer   # CSV + PNG
++"""
++
++from __future__ import annotations
++
++import argparse
++import math
++import sys
++from pathlib import Path
++
++import cv2
++import numpy as np
++
++sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
++
++from navigation.config import load_config  # noqa: E402
++from navigation.models import Pose  # noqa: E402
++from navigation.slam_eval import associate, ate_rmse, project_to_plane  # noqa: E402
++from navigation.vslam import SlamConfig, VisualSLAM  # noqa: E402
++
++# TUM RGB-D calibrated intrinsics (640 x 480).
++TUM_CAMERAS = {
++    "fr1": (517.3, 516.5, 318.6, 255.3),
++    "fr2": (520.9, 521.0, 325.1, 249.7),
++    "fr3": (535.4, 539.2, 320.1, 247.6),
++}
++
++
++def read_list(path: Path) -> list[list[str]]:
++    rows = []
++    for line in path.read_text().splitlines():
++        if line.strip() and not line.startswith("#"):
++            rows.append(line.split())
++    return rows
++
++
++class GtOdometer:
++    """Metric distance walked, from the ground truth (no heading help)."""
++
++    stride_m = 0.001
++
++    def __init__(self, times: np.ndarray, xyz: np.ndarray) -> None:
++        self.times = times
++        self.cum = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(xyz, axis=0), axis=1))])
++        self.step_count = 0
++
++    def update(self, t: float) -> None:
++        j = int(np.clip(np.searchsorted(self.times, t), 0, len(self.times) - 1))
++        self.step_count = int(self.cum[j] / self.stride_m)
++
++    def get_pose(self, t: float) -> Pose:
++        return Pose(0.0, 0.0, 0.0, t, valid=False)
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    parser.add_argument("sequence", type=Path, help="Unpacked TUM sequence folder")
++    parser.add_argument("--camera", choices=sorted(TUM_CAMERAS), default="fr2")
++    parser.add_argument("--scale", choices=("gt", "assumed"), default="gt")
++    parser.add_argument("--max-frames", type=int, default=None)
++    parser.add_argument("--out", type=Path, default=None, help="Folder for trajectory CSV + plot")
++    args = parser.parse_args()
++
++    rgb = read_list(args.sequence / "rgb.txt")
++    gt_rows = read_list(args.sequence / "groundtruth.txt")
++    gt_times = np.array([float(r[0]) for r in gt_rows])
++    gt_xyz = np.array([[float(v) for v in r[1:4]] for r in gt_rows])
++
++    fx, fy, cx, cy = TUM_CAMERAS[args.camera]
++    section = dict(load_config()["slam"])
++    section.update(fx=fx, fy=fy, cx=cx, cy=cy, calib_width=640, camera_pitch_deg=0.0)
++    cfg = SlamConfig.from_config(section)
++
++    helper = GtOdometer(gt_times, gt_xyz) if args.scale == "gt" else None
++    slam: VisualSLAM | None = None
++    times, est = [], []
++    frames = rgb[: args.max_frames] if args.max_frames else rgb
++    for n, (stamp, rel_path) in enumerate(frames):
++        image = cv2.imread(str(args.sequence / rel_path))
++        if image is None:
++            continue
++        t = float(stamp)
++        if slam is None:
++            slam = VisualSLAM(cfg, (image.shape[1], image.shape[0]), helper=helper, log=print)
++        if helper is not None:
++            helper.update(t)
++        pose = slam.process(image, t)
++        if pose.valid:
++            times.append(t)
++            est.append((pose.x, pose.y))
++        if n % 200 == 0:
++            print(f"frame {n}/{len(frames)} state={slam.state} kf={len(slam.keyframes)} loops={slam.loop_closures}")
++
++    if slam is None or len(est) < 10:
++        raise SystemExit("Too few tracked frames to evaluate.")
++
++    # Keyframe poses after the final optimization are the map estimate;
++    # per-frame poses are what the pipeline used live. Report both.
++    pairs = associate(times, gt_times)
++    est_xy = np.array([est[i] for i, _ in pairs])
++    gt_plane = project_to_plane(gt_xyz)
++    gt_xy = np.array([gt_plane[j] for _, j in pairs])
++    ate_live, aligned = ate_rmse(est_xy, gt_xy)
++
++    kf_times = [kf.timestamp for kf in sorted(slam.keyframes.values(), key=lambda k: k.kf_id)]
++    kf_xy = np.array([kf.pose[:2] for kf in sorted(slam.keyframes.values(), key=lambda k: k.kf_id)])
++    kf_pairs = associate(kf_times, gt_times)
++    ate_kf = (
++        ate_rmse(np.array([kf_xy[i] for i, _ in kf_pairs]), np.array([gt_plane[j] for _, j in kf_pairs]))[0]
++        if len(kf_pairs) >= 3
++        else float("nan")
++    )
++    length = float(np.sum(np.linalg.norm(np.diff(gt_xy, axis=0), axis=1)))
++
++    print("\n" + "=" * 60)
++    print(f"Sequence: {args.sequence.name}  (scale from {args.scale})")
++    print(f"Frames tracked: {len(est)}/{len(frames)}  keyframes: {len(slam.keyframes)}  "
++          f"loop closures: {slam.loop_closures}")
++    print(f"Ground-truth path length: {length:.2f} m")
++    print(f"ATE RMSE (live per-frame pose): {ate_live:.3f} m  ({100 * ate_live / max(length, 1e-9):.1f} % of path)")
++    print(f"ATE RMSE (keyframes after loop closure): {ate_kf:.3f} m")
++    print("=" * 60)
++
++    if args.out is not None:
++        args.out.mkdir(parents=True, exist_ok=True)
++        lines = ["time_s,est_x,est_y,gt_x,gt_y"]
++        lines += [f"{times[i]:.4f},{a[0]:.4f},{a[1]:.4f},{g[0]:.4f},{g[1]:.4f}"
++                  for (i, _), a, g in zip(pairs, aligned, gt_xy)]
++        (args.out / "trajectory.csv").write_text("\n".join(lines) + "\n")
++        draw_plot(args.out / "trajectory.png", gt_xy, aligned, f"{args.sequence.name}  ATE {ate_live:.3f} m")
++        print(f"Saved {args.out / 'trajectory.csv'} and trajectory.png")
++
++
++def draw_plot(path: Path, gt: np.ndarray, est: np.ndarray, title: str, size: int = 700) -> None:
++    img = np.full((size, size, 3), 255, np.uint8)
++    pts = np.vstack([gt, est])
++    lo, hi = pts.min(axis=0), pts.max(axis=0)
++    span = max(float(np.max(hi - lo)), 1e-6) * 1.1
++    centre = (hi + lo) / 2
++
++    def px(p):
++        return (int(size / 2 + (p[0] - centre[0]) / span * (size - 80)),
++                int(size / 2 + 20 - (p[1] - centre[1]) / span * (size - 80)))
++
++    cv2.polylines(img, [np.array([px(p) for p in gt], np.int32)], False, (60, 60, 60), 2, cv2.LINE_AA)
++    cv2.polylines(img, [np.array([px(p) for p in est], np.int32)], False, (40, 120, 255), 2, cv2.LINE_AA)
++    cv2.putText(img, title, (12, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1, cv2.LINE_AA)
++    cv2.putText(img, "grey: ground truth   orange: SLAM", (12, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
++    cv2.imwrite(str(path), img)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/eval_walk_drift.py b/tools/eval_walk_drift.py
+new file mode 100644
+index 0000000..6a39863
+--- /dev/null
++++ b/tools/eval_walk_drift.py
+@@ -0,0 +1,76 @@
++"""Drift of real campus walks, from the demo's --trajectory-out CSV files.
++
++Walk a closed loop that ends exactly at the taped start mark, once with
++--pose phone and once with --pose slam (same route), each with
++--trajectory-out. This prints distance walked, start-to-end error and
++drift (% of distance) for each file, and saves a top-down PNG.
++
++    python tools/eval_walk_drift.py runs\\loop_phone.csv runs\\loop_slam.csv --png runs\\loop.png
++"""
++
++from __future__ import annotations
++
++import argparse
++import csv
++import sys
++from pathlib import Path
++
++import cv2
++import numpy as np
++
++sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
++
++from navigation.slam_eval import loop_drift  # noqa: E402
++
++COLORS = [(40, 120, 255), (60, 170, 60), (200, 80, 40), (150, 60, 150)]
++
++
++def load_xy(path: Path) -> np.ndarray:
++    with path.open(newline="", encoding="utf-8") as handle:
++        rows = [r for r in csv.DictReader(handle) if r.get("valid", "1") == "1"]
++    return np.array([[float(r["x"]), float(r["y"])] for r in rows])
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    parser.add_argument("csv", type=Path, nargs="+")
++    parser.add_argument("--png", type=Path, default=None)
++    args = parser.parse_args()
++
++    paths = []
++    print(f"{'file':32s} {'distance m':>11s} {'end error m':>12s} {'drift %':>8s}")
++    for path in args.csv:
++        xy = load_xy(path)
++        if len(xy) < 2:
++            print(f"{path.name:32s} (no valid poses)")
++            continue
++        d = loop_drift(xy)
++        print(f"{path.name:32s} {d['distance_m']:11.2f} {d['end_error_m']:12.2f} {d['drift_percent']:8.1f}")
++        paths.append((path.stem, xy))
++
++    if args.png is not None and paths:
++        size = 700
++        img = np.full((size, size, 3), 255, np.uint8)
++        allp = np.vstack([xy for _n, xy in paths])
++        lo, hi = allp.min(axis=0), allp.max(axis=0)
++        span = max(float(np.max(hi - lo)), 1.0) * 1.15
++        centre = (hi + lo) / 2
++
++        def px(p):
++            return (int(size / 2 + (p[0] - centre[0]) / span * (size - 80)),
++                    int(size / 2 + 20 - (p[1] - centre[1]) / span * (size - 80)))
++
++        for n, (name, xy) in enumerate(paths):
++            color = COLORS[n % len(COLORS)]
++            cv2.polylines(img, [np.array([px(p) for p in xy], np.int32)], False, color, 2, cv2.LINE_AA)
++            cv2.circle(img, px(xy[-1]), 6, color, -1)
++            cv2.putText(img, name, (12, 24 + 22 * n), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
++        cv2.circle(img, px(paths[0][1][0]), 8, (0, 0, 0), 2)
++        cv2.putText(img, "o = start, dot = end", (12, size - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
++        args.png.parent.mkdir(parents=True, exist_ok=True)
++        cv2.imwrite(str(args.png), img)
++        print(f"Saved {args.png}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/simulate_slam_walk.py b/tools/simulate_slam_walk.py
+new file mode 100644
+index 0000000..e1e76a4
+--- /dev/null
++++ b/tools/simulate_slam_walk.py
+@@ -0,0 +1,90 @@
++"""Simulation check: visual SLAM vs phone dead reckoning on a known path.
++
++Renders a chest camera walking square laps inside a textured room
++(navigation/synthetic_scene.py), with a simulated phone that miscounts
++stride length and whose heading drifts. Prints drift and ATE for both
++pose sources against ground truth, and can write a side-by-side video.
++This validates the SLAM logic; it is not a substitute for real walks.
++
++    python tools/simulate_slam_walk.py --laps 2 --video runs\\sim_slam.mp4
++"""
++
++from __future__ import annotations
++
++import argparse
++import math
++import sys
++from pathlib import Path
++
++import cv2
++import numpy as np
++
++sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
++
++from navigation.config import load_config  # noqa: E402
++from navigation.minimap import draw_minimap  # noqa: E402
++from navigation.slam_eval import ate_rmse  # noqa: E402
++from navigation.synthetic_scene import FakePhone, Room, render, square_walk  # noqa: E402
++from navigation.vslam import SlamConfig, VisualSLAM, camera_matrix  # noqa: E402
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    parser.add_argument("--laps", type=int, default=2)
++    parser.add_argument("--side", type=float, default=8.0, help="square side (m)")
++    parser.add_argument("--stride-error", type=float, default=0.07, help="true stride = (1 + e) x configured")
++    parser.add_argument("--heading-drift", type=float, default=0.3, help="phone heading drift (deg/s)")
++    parser.add_argument("--video", type=Path, default=None)
++    args = parser.parse_args()
++
++    size = (640, 360)
++    cfg = SlamConfig.from_config(load_config()["slam"])
++    K = camera_matrix(cfg, *size)
++    room = Room()
++    walk = square_walk(side_m=args.side, laps=args.laps)
++    phone = FakePhone(stride_m=0.7, true_stride_m=0.7 * (1 + args.stride_error), drift_deg_s=args.heading_drift)
++    slam = VisualSLAM(cfg, size, helper=phone, log=print)
++    x0, y0 = walk[0][1], walk[0][2]
++
++    writer = None
++    if args.video is not None:
++        args.video.parent.mkdir(parents=True, exist_ok=True)
++        writer = cv2.VideoWriter(str(args.video), cv2.VideoWriter.fourcc(*"mp4v"), 10, (size[0] * 2, size[1]))
++
++    gt, est_slam, est_phone = [], [], []
++    for t, x, y, h in walk:
++        phone.update(t, x, y, h)
++        frame = render(room, x, y, h, K, size)
++        pose = slam.process(frame, t)
++        gt.append((x - x0, y - y0))
++        est_slam.append((pose.x, pose.y))
++        pp = phone.get_pose(t)
++        est_phone.append((pp.x, pp.y))
++        if writer is not None:
++            left = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
++            right = np.zeros_like(left)
++            kfs = [kf.pose[:2] for kf in sorted(slam.keyframes.values(), key=lambda k: k.kf_id)]
++            draw_minimap(right, kfs + [(pose.x, pose.y)], kfs, slam.loop_edges(), [],
++                         (pose.x, pose.y, pose.heading_deg), slam.state,
++                         info=f"loops {slam.loop_closures}", size=340, margin=10)
++            cv2.putText(right, "SLAM (keyframe map)", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
++            writer.write(np.hstack([left, right]))
++    if writer is not None:
++        writer.release()
++
++    gt_a, s_a, p_a = map(np.array, (gt, est_slam, est_phone))
++    walked = float(np.sum(np.linalg.norm(np.diff(gt_a, axis=0), axis=1)))
++    print("\n" + "=" * 64)
++    print(f"Simulated walk: {args.laps} lap(s), {walked:.1f} m, stride error {100 * args.stride_error:.0f} %, "
++          f"phone heading drift {args.heading_drift} deg/s")
++    print(f"{'pose source':22s} {'end error m':>12s} {'drift %':>8s} {'ATE (Sim2) m':>13s}")
++    for name, e in (("phone dead reckoning", p_a), ("visual SLAM", s_a)):
++        end = math.dist(e[-1], gt_a[-1])
++        ate, _ = ate_rmse(e, gt_a)
++        print(f"{name:22s} {end:12.2f} {100 * end / walked:8.1f} {ate:13.3f}")
++    print(f"SLAM: {len(slam.keyframes)} keyframes, {slam.loop_closures} loop closures")
++    print("=" * 64)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/video_navigation_demo_slam_memory.py b/video_navigation_demo_slam_memory.py
+index 743fc7d..e29ba8a 100644
+--- a/video_navigation_demo_slam_memory.py
++++ b/video_navigation_demo_slam_memory.py
+@@ -11,10 +11,14 @@ Pipeline:
+       -> urgent HRTF or soft path-guidance HRTF
+       -> annotated video + JSON report
+ 
+-Pose (--pose): "phone" reads heading + steps from the SensorServer app on
+-the chest-mounted phone (default for stream URLs); "sim" uses a simulated
+-walk (default for video files). While the phone pose is invalid (no sensor
+-data for pose.stale_after_s), nothing is written to persistent memory.
++Pose (--pose): "slam" runs the visual SLAM in navigation/vslam.py on the
++camera frames (phone steps/heading help with scale and heading when the
++SensorServer app is reachable; --no-phone for camera only); "phone" reads
++heading + steps from the SensorServer app on the chest-mounted phone
++(default for stream URLs); "sim" uses a simulated walk (default for video
++files). While the pose is invalid (no sensor data, SLAM lost without the
++phone, or SLAM still relocalizing in a saved map), nothing is written to
++persistent memory.
+ 
+ All tunables come from config.yaml (see --config). Dedicated flags such as
+ --confidence, and any number of --set section.key=value, override it.
+@@ -27,6 +31,13 @@ Examples (PowerShell):
+     # Live phone camera (IP Webcam app); default source is camera.source
+     python video_navigation_demo_slam_memory.py --no-display
+ 
++    # Live with visual SLAM (map saved to slam_map.npz, reused next run)
++    python video_navigation_demo_slam_memory.py --pose slam
++
++    # Recorded video with visual SLAM, camera only, fresh map
++    python video_navigation_demo_slam_memory.py --source videos\\walk.mp4 `
++        --pose slam --no-phone --slam-new-map --reset
++
+ Weights default to perception.weights in config.yaml (best.pt).
+ """
+ 
+@@ -53,12 +64,19 @@ from navigation.config import (
+ from navigation.hazard import HazardSeverityClassifier
+ from navigation.hrtf_renderer import HRTFRenderer
+ from navigation.memory import RouteMemory
++from navigation.minimap import draw_minimap
+ from navigation.models import FramePacket, Pose
+ from navigation.planner import LocalPathPlanner
+ from navigation.range_sensor import RangeSensor
+ from navigation.reasoning import AcousticAttention
+ from navigation.sensing import PhonePose, localize_detection, simulated_pose
+ from navigation.trajectory import HazardTrajectoryTracker
++from navigation.vslam import (
++    SlamConfig,
++    VisualSLAM,
++    boxes_from_yolo_result,
++    relative,
++)
+ from navigation.yolo_perception import YOLOPerception
+ 
+ 
+@@ -204,10 +222,38 @@ def main() -> None:
+     )
+     parser.add_argument(
+         "--pose",
+-        choices=("sim", "phone"),
++        choices=("sim", "phone", "slam"),
++        default=None,
++        help="Pose source: slam = visual SLAM on the camera frames (+ phone "
++        "steps/heading if reachable), phone = SensorServer app (heading + "
++        "steps), sim = simulated walk (default: phone for stream URLs, sim "
++        "for files)",
++    )
++    parser.add_argument(
++        "--slam-map",
++        type=Path,
+         default=None,
+-        help="Pose source: phone = SensorServer app (heading + steps), "
+-        "sim = simulated walk (default: phone for stream URLs, sim for files)",
++        help="SLAM map file (config: slam.map_path). Loaded at start to "
++        "relocalize in the same world frame as earlier runs; saved at the end",
++    )
++    parser.add_argument(
++        "--slam-new-map",
++        action="store_true",
++        help="Ignore an existing SLAM map and start a new one (it is "
++        "overwritten at the end). Use --reset too: old hazards would be in "
++        "the old map's frame",
++    )
++    parser.add_argument(
++        "--no-phone",
++        action="store_true",
++        help="With --pose slam: do not use the phone's SensorServer data "
++        "(scale then comes from slam.assumed_speed_m_s)",
++    )
++    parser.add_argument(
++        "--trajectory-out",
++        type=Path,
++        default=None,
++        help="Write the per-frame pose to this CSV (for tools/eval_walk_drift.py)",
+     )
+     parser.add_argument(
+         "--config",
+@@ -320,6 +366,9 @@ def main() -> None:
+                 "audio.hrtf_path": None if args.hrtf is None else str(args.hrtf),
+                 "audio.device": args.audio_device,
+                 "esp32.serial_port": args.esp32_port,
++                "slam.map_path": (
++                    None if args.slam_map is None else str(args.slam_map)
++                ),
+             },
+         )
+     except ConfigError as error:
+@@ -332,6 +381,7 @@ def main() -> None:
+     audio_cfg = config["audio"]
+     pose_cfg = config["pose"]
+     network_cfg = config["network"]
++    slam_cfg = config["slam"]
+ 
+     source = str(camera_cfg["source"])
+     live = is_url(source)
+@@ -438,7 +488,8 @@ def main() -> None:
+ 
+     phone_pose: PhonePose | None = None
+ 
+-    if pose_mode == "phone":
++    use_phone = pose_mode == "phone" or (pose_mode == "slam" and not args.no_phone)
++    if use_phone:
+         phone_pose = PhonePose.from_config(network_cfg, pose_cfg)
+         print(
+             "Connecting to phone sensors at "
+@@ -447,14 +498,28 @@ def main() -> None:
+         try:
+             phone_pose.start()
+         except RuntimeError as error:
+-            frame_source.close()
+-            if hrtf_renderer is not None:
+-                hrtf_renderer.close()
+-            raise SystemExit(f"Phone pose setup failed: {error}") from error
++            if pose_mode == "slam":
++                print(
++                    f"WARNING: phone sensors unavailable ({error}); SLAM runs "
++                    "camera-only, scale from slam.assumed_speed_m_s.\n"
++                )
++                phone_pose = None
++            else:
++                frame_source.close()
++                if hrtf_renderer is not None:
++                    hrtf_renderer.close()
++                raise SystemExit(f"Phone pose setup failed: {error}") from error
+ 
++    if phone_pose is not None:
+         if phone_pose.wait_for_heading(float(pose_cfg["startup_wait_s"])):
+             phone_pose.calibrate()
+             print("Phone pose ready; current heading set as 0.\n")
++        elif pose_mode == "slam":
++            print(
++                "WARNING: no rotation data from the phone yet. SLAM continues "
++                "with the camera; phone steps/heading are used once they "
++                "arrive.\n"
++            )
+         else:
+             print(
+                 "WARNING: no rotation data from the phone yet. Check the "
+@@ -462,9 +527,36 @@ def main() -> None:
+                 "--pose sim. Continuing; memory is paused until the pose is "
+                 "valid, and the first heading becomes 0.\n"
+             )
+-    else:
++
++    # Visual SLAM is created on the first frame (needs the frame size).
++    slam: VisualSLAM | None = None
++    slam_config = SlamConfig.from_config(slam_cfg)
++    slam_map_path = Path(slam_cfg["map_path"])
++    slam_every_n = max(1, int(slam_cfg["process_every_n"]))
++    slam_map_version = 0
++    slam_seconds = 0.0
++    slam_frames = 0
++    reanchored_total = 0
++    dynamic_labels = frozenset(memory_cfg["dynamic_labels"])
++    if pose_mode == "slam":
++        print(
++            "Pose: visual SLAM"
++            + (" + phone steps/heading" if phone_pose is not None else " (camera only)")
++            + f"; map file {slam_map_path}"
++            + (" (new map)" if args.slam_new_map else "")
++            + "\n"
++        )
++        if args.slam_new_map and not args.reset:
++            print(
++                "NOTE: --slam-new-map without --reset: hazards already in "
++                "memory are in the old map's frame.\n"
++            )
++    elif pose_mode == "sim":
+         print("Pose: simulated walk (--pose sim).\n")
+ 
++    trajectory_rows: list[tuple[float, float, float, float, int, str]] = []
++    trajectory_xy: list[tuple[float, float]] = []
++
+     # Range sensor: started and stopped only for now (fusion comes later).
+     # A missing port prints one warning; the run continues without it.
+     range_sensor: RangeSensor | None = None
+@@ -550,7 +642,40 @@ def main() -> None:
+                 image=image,
+             )
+ 
+-            if phone_pose is not None:
++            detections = perception.process(frame_packet)
++
++            if pose_mode == "slam":
++                if slam is None:
++                    frame_h, frame_w = image.shape[:2]
++                    try:
++                        slam = VisualSLAM(
++                            slam_config,
++                            (frame_w, frame_h),
++                            helper=phone_pose,
++                            map_path=slam_map_path,
++                            new_map=args.slam_new_map,
++                        )
++                    except ValueError as error:
++                        raise SystemExit(f"SLAM map error: {error}") from error
++                if (frame_id - 1) % slam_every_n == 0:
++                    slam_started = time.perf_counter()
++                    pose = slam.process(
++                        image,
++                        timestamp,
++                        boxes_from_yolo_result(perception.last_result, dynamic_labels),
++                    )
++                    slam_seconds += time.perf_counter() - slam_started
++                    slam_frames += 1
++                else:
++                    pose = slam.get_pose(timestamp)
++                if slam.map_version != slam_map_version:
++                    # Loop closure moved keyframes: move anchored hazards too.
++                    slam_map_version = slam.map_version
++                    moved = memory.reanchor(slam.anchor_poses())
++                    reanchored_total += moved
++                    if moved:
++                        print(f"SLAM | moved {moved} remembered hazard(s) with the corrected map")
++            elif phone_pose is not None:
+                 pose = phone_pose.get_pose(timestamp)
+             else:
+                 pose = simulated_pose(elapsed_s)
+@@ -562,11 +687,23 @@ def main() -> None:
+                     print(
+                         "POSE | valid, memory writing resumed"
+                         if pose.valid
+-                        else "POSE | INVALID (no phone sensor data), "
+-                        "memory writing paused"
++                        else "POSE | INVALID ("
++                        + (
++                            f"SLAM {slam.state}"
++                            if slam is not None
++                            else "no phone sensor data"
++                        )
++                        + "), memory writing paused"
+                     )
+                 pose_was_valid = pose.valid
+-            detections = perception.process(frame_packet)
++
++            slam_state = slam.state if slam is not None else pose_mode.upper()
++            trajectory_rows.append(
++                (round(elapsed_s, 3), pose.x, pose.y, pose.heading_deg, int(pose.valid), slam_state)
++            )
++            if pose.valid:
++                trajectory_xy.append((pose.x, pose.y))
++            anchor_kf = slam.current_anchor() if slam is not None else None
+ 
+             # -------------------------------------------------
+             # Current-frame hazards
+@@ -600,6 +737,17 @@ def main() -> None:
+                     velocity_y=track.velocity_y,
+                     # Invalid pose: world position unknown, don't store it.
+                     persist=pose.valid,
++                    anchor=(
++                        None
++                        if anchor_kf is None
++                        else (
++                            anchor_kf[0],
++                            *relative(
++                                anchor_kf[1],
++                                (localized.world_x, localized.world_y, 0.0),
++                            )[:2],
++                        )
++                    ),
+                 )
+ 
+                 current_frame_hazards.append(entry)
+@@ -749,6 +897,39 @@ def main() -> None:
+                 pose_mode=pose_mode,
+             )
+ 
++            draw_minimap(
++                display,
++                (
++                    # SLAM: the keyframe chain is the corrected path.
++                    [
++                        (kf.pose[0], kf.pose[1])
++                        for kf in sorted(slam.keyframes.values(), key=lambda k: k.kf_id)
++                        if kf.kf_id >= slam.loaded_keyframes
++                    ]
++                    + [(pose.x, pose.y)]
++                    if slam is not None
++                    else trajectory_xy[-2000:]
++                ),
++                (
++                    [(kf.pose[0], kf.pose[1]) for kf in slam.keyframes.values()]
++                    if slam is not None
++                    else []
++                ),
++                slam.loop_edges() if slam is not None else [],
++                [
++                    (h.world_x, h.world_y, h.label, h.decay_weight)
++                    for h in memory.get_hazards()[:40]
++                ],
++                (pose.x, pose.y, pose.heading_deg),
++                slam_state,
++                info=(
++                    f"kf {len(slam.keyframes)}  loops {slam.loop_closures}  "
++                    f"inl {slam.last_inliers}"
++                    if slam is not None
++                    else ""
++                ),
++            )
++
+             writer.write(display)
+ 
+             # -------------------------------------------------
+@@ -857,6 +1038,19 @@ def main() -> None:
+         if range_sensor is not None:
+             range_sensor.close()
+ 
++        if slam is not None and slam.keyframes:
++            slam.save_map(slam_map_path)
++            print(f"SLAM map saved: {slam_map_path.resolve()} ({len(slam.keyframes)} keyframes)")
++
++    if args.trajectory_out is not None and trajectory_rows:
++        args.trajectory_out.parent.mkdir(parents=True, exist_ok=True)
++        lines = ["time_s,x,y,heading_deg,valid,state"]
++        lines += [
++            f"{t},{x:.4f},{y:.4f},{h:.3f},{v},{st}" for t, x, y, h, v, st in trajectory_rows
++        ]
++        args.trajectory_out.write_text("\n".join(lines) + "\n", encoding="utf-8")
++        print(f"Trajectory CSV: {args.trajectory_out.resolve()}")
++
+     processing_seconds = time.perf_counter() - processing_started
+     persisted_hazards = memory.get_hazards()
+ 
+@@ -878,6 +1072,28 @@ def main() -> None:
+         "path_warning_audio_played": path_warning_audio_count,
+         "frames_processed": frame_id,
+         "invalid_pose_frames": invalid_pose_frames,
++        "slam": (
++            None
++            if slam is None
++            else {
++                "map_file": str(slam_map_path.resolve()),
++                "map_id": slam.map_id,
++                "keyframes": len(slam.keyframes),
++                "keyframes_loaded_from_earlier_runs": slam.loaded_keyframes,
++                "loop_closures": slam.loop_closures,
++                "relocalizations": slam.relocalizations,
++                "hazards_moved_by_map_corrections": reanchored_total,
++                "final_state": slam.state,
++                "frames_processed_by_slam": slam_frames,
++                "mean_slam_ms_per_frame": (
++                    round(1000 * slam_seconds / slam_frames, 1) if slam_frames else None
++                ),
++                "events": [
++                    {"time": round(e.timestamp, 3), "kind": e.kind, "detail": e.detail}
++                    for e in slam.events
++                ],
++            }
++        ),
+         "video_fps": fps,
+         "warning_frames": warning_frames,
+         "unique_warning_objects": len(unique_warning_ids),
+@@ -923,6 +1139,11 @@ def main() -> None:
+                 "Pose is phone heading + step counting (stride from config); "
+                 "position drifts over long walks."
+                 if pose_mode == "phone"
++                else "Pose is lightweight monocular visual SLAM (2D ground-plane "
++                "pose, ORB visual odometry, loop closure, saved map); metric "
++                "scale comes from phone steps or an assumed walking speed, and "
++                "tracking can fail in low texture, low light or fast turns."
++                if pose_mode == "slam"
+                 else "Pose comes from a deterministic simulated trajectory, "
+                 "not real localization."
+             ),
+-- 
+2.43.0
+
