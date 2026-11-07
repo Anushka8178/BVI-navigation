@@ -15,7 +15,8 @@ DEFAULT_MATCH_RADIUS_M = 1.0
 # Labels that can move on their own: matched against the position
 # predicted from their stored velocity, not their last-seen position.
 DEFAULT_DYNAMIC_LABELS = frozenset(
-    {"person", "dog", "bicycle", "car", "bus", "truck", "motorbike", "tricycle"}
+    {"person", "dog", "bicycle", "car", "bus", "truck", "motorbike", "tricycle",
+     "autorickshaw", "animal"}
 )
 
 

@@ -38,6 +38,10 @@ class HazardSeverityClassifier:
         immediate_close_m: float = 1.5,
         critical_ttc_s: float = 1.5,
         high_risk_ttc_s: float = 2.5,
+        ground_hazard_bonus: float = 0.25,
+        ground_labels: tuple[str, ...] | list[str] = (
+            "pothole", "stairs", "curb", "drain",
+        ),
     ) -> None:
         self.urgency_threshold = urgency_threshold
         self.directly_ahead_deg = directly_ahead_deg
@@ -45,6 +49,8 @@ class HazardSeverityClassifier:
         self.immediate_close_m = immediate_close_m
         self.critical_ttc_s = critical_ttc_s
         self.high_risk_ttc_s = high_risk_ttc_s
+        self.ground_hazard_bonus = ground_hazard_bonus
+        self.ground_labels = frozenset(ground_labels)
 
     def classify(
         self,
@@ -74,11 +80,20 @@ class HazardSeverityClassifier:
             1.0 + distance
         )
 
+        # Negative obstacles (pothole, stairs, curb, drain) are trip/fall
+        # hazards a cane may miss, so they reach urgent sooner.
+        ground_bonus = (
+            self.ground_hazard_bonus
+            if (detection.ground_level or detection.label in self.ground_labels)
+            else 0.0
+        )
+
         score = min(
             1.0,
             0.50 * proximity
             + 0.25 * alignment
-            + motion_risk,
+            + motion_risk
+            + ground_bonus,
         )
 
         # --------------------------------------------------

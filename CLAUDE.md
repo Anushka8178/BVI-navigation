@@ -43,7 +43,12 @@ big refactors. Do not add heavy new dependencies. Do not rewrite modules that al
 - Main entry point: `video_navigation_demo_slam_memory.py`.
 - Modules: `navigation/` (models, yolo_perception, hazard, sensing, memory, planner, trajectory,
   reasoning, audio, hrtf_renderer). HRTF file: `hrtf/mit_kemar_normal_pinna.sofa`.
-- Detector: custom YOLO11n `best.pt`, 15 OD classes. These classes do NOT include stairs, curbs or potholes.
+- Detector: custom YOLO26 `best.pt`, 23 classes: stop_sign, person, bicycle, bus, truck, car,
+  motorbike, reflective_cone, ashcan, warning_column, spherical_roadblock, pole, dog, tricycle,
+  fire_hydrant, pothole, stairs, curb, drain, tree, autorickshaw, animal, barrier.
+  Ground-level classes (pothole, stairs, curb, drain) get distance from the box bottom edge
+  (flat ground, `perception.camera_height_m`) and a severity bonus (`hazard.ground_hazard_bonus`).
+  Needs `ultralytics>=8.4`.
 
 ## Known bugs to fix (verified in the code)
 1. **Pose doesn't follow the video:** `simulated_pose(t)` invents motion. Replace it with `PhonePose`.

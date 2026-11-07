@@ -387,6 +387,10 @@ def main() -> None:
         weights=weights_path,
         confidence=float(perception_cfg["confidence"]),
         device=str(perception_cfg["device"]),
+        camera_height_m=float(perception_cfg["camera_height_m"]),
+        ground_labels=frozenset(perception_cfg["ground_labels"]),
+        ground_min_m=float(perception_cfg["ground_min_m"]),
+        ground_max_m=float(perception_cfg["ground_max_m"]),
     )
 
     severity = HazardSeverityClassifier(**config["hazard"])

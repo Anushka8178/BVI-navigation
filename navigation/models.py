@@ -24,6 +24,9 @@ class Detection:
     relative_y: float
     confidence: float
     motion: Motion = Motion.STATIC
+    # True for ground-level classes (pothole, stairs, curb, drain) whose
+    # distance comes from the box bottom edge (flat-ground model).
+    ground_level: bool = False
 
     @property
     def distance(self) -> float:

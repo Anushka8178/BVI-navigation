@@ -8,7 +8,7 @@ sofar>=1.2,<2
 
 # Computer vision / YOLO
 opencv-python>=4.10,<5
-ultralytics>=8.3,<9
+ultralytics>=8.4,<9  # YOLO26 needs 8.4+
 
 # Configuration (config.yaml)
 pyyaml>=6,<7
