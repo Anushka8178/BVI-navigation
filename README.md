@@ -202,7 +202,16 @@ python video_navigation_demo_slam_memory.py --source videos\walk.mp4 --pose slam
 ```
 
 The annotated video has a mini-map (bottom right): keyframe path, loop-closure
-links, remembered hazards and the SLAM state (TRACKING / RELOCALIZING / LOST).
+links, remembered hazards, the planner's lanes and the SLAM state
+(TRACKING / RELOCALIZING / LOST).
+
+**Walking lanes** (`navigation/path_overlay.py`, every pose mode): the five
+lanes the local planner checks each frame (-1.5, -0.75, 0, +0.75, +1.5 m,
+`planner.path_width_m` wide, out to `planner.horizon_m`) are projected onto the
+ground in the video with the same camera model perception uses. The chosen lane
+is green with an arrow from the user ("AHEAD", or "GO LEFT" when the current
+lane is blocked), blocked lanes are red, the current lane is outlined in white.
+`--no-lanes` turns this off.
 The JSON report has a `slam` block (keyframes, loop closures, relocalizations,
 hazards moved, events, ms per frame).
 

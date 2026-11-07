@@ -33,10 +33,15 @@ def draw_minimap(
     info: str = "",
     size: int = 260,
     margin: int = 12,
+    lanes: Sequence[tuple[float, bool, bool]] = (),
+    lane_width_m: float = 0.65,
+    lane_length_m: float = 5.0,
 ) -> None:
     """Draw the mini-map in place in the bottom-right corner.
 
     hazards: (world_x, world_y, label, decay_weight).
+    lanes: planner lanes as (lateral_offset_m, safe, selected), drawn
+    from the current pose along its heading.
     """
     h_img, w_img = image.shape[:2]
     size = min(size, int(0.45 * h_img), w_img - 2 * margin)
@@ -82,6 +87,26 @@ def draw_minimap(
         p = to_px(hx, hy)
         cv2.circle(panel, p, 4, (0, 0, shade), -1)
         cv2.putText(panel, label[:8], (p[0] + 5, p[1] - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 0, shade), 1)
+
+    if lanes:
+        hr = math.radians(pose[2])
+        fwd = (math.sin(hr), math.cos(hr))
+        rgt = (math.cos(hr), -math.sin(hr))
+        lane_layer = panel.copy()
+        for offset, safe, selected in lanes:
+            corners = []
+            for side, dist in ((-1, 0.0), (1, 0.0), (1, lane_length_m), (-1, lane_length_m)):
+                lat = offset + side * lane_width_m / 2.0
+                corners.append(to_px(pose[0] + rgt[0] * lat + fwd[0] * dist,
+                                     pose[1] + rgt[1] * lat + fwd[1] * dist))
+            poly = np.array(corners, np.int32)
+            if selected:
+                cv2.fillPoly(lane_layer, [poly], (80, 220, 80))
+            elif not safe:
+                cv2.fillPoly(lane_layer, [poly], (60, 60, 230))
+            else:
+                cv2.polylines(lane_layer, [poly], True, (80, 160, 80), 1, cv2.LINE_AA)
+        cv2.addWeighted(lane_layer, 0.5, panel, 0.5, 0, panel)
 
     px, py = to_px(pose[0], pose[1])
     h = math.radians(pose[2])

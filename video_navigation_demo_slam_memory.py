@@ -65,6 +65,7 @@ from navigation.hazard import HazardSeverityClassifier
 from navigation.hrtf_renderer import HRTFRenderer
 from navigation.memory import RouteMemory
 from navigation.minimap import draw_minimap
+from navigation.path_overlay import draw_lanes, lanes_for_minimap
 from navigation.models import FramePacket, Pose
 from navigation.planner import LocalPathPlanner
 from navigation.range_sensor import RangeSensor
@@ -248,6 +249,11 @@ def main() -> None:
         action="store_true",
         help="With --pose slam: do not use the phone's SensorServer data "
         "(scale then comes from slam.assumed_speed_m_s)",
+    )
+    parser.add_argument(
+        "--no-lanes",
+        action="store_true",
+        help="Do not draw the path planner's walking lanes on the video",
     )
     parser.add_argument(
         "--trajectory-out",
@@ -897,6 +903,16 @@ def main() -> None:
                 pose_mode=pose_mode,
             )
 
+            if not args.no_lanes:
+                draw_lanes(
+                    display,
+                    path_decision,
+                    path_width_m=float(config["planner"]["path_width_m"]),
+                    horizon_m=float(config["planner"]["horizon_m"]),
+                    camera_height_m=float(perception_cfg["camera_height_m"]),
+                    hfov_deg=float(perception.horizontal_fov_deg),
+                )
+
             draw_minimap(
                 display,
                 (
@@ -928,6 +944,9 @@ def main() -> None:
                     if slam is not None
                     else ""
                 ),
+                lanes=[] if args.no_lanes else lanes_for_minimap(path_decision),
+                lane_width_m=float(config["planner"]["path_width_m"]),
+                lane_length_m=float(config["planner"]["horizon_m"]),
             )
 
             writer.write(display)
