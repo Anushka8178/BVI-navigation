@@ -457,13 +457,10 @@ def main() -> None:
     # TTC keep the pipeline clock.
     memory_clock = SessionClock(live=live)
     session_id = uuid.uuid4().hex
-    memory = RouteMemory(
-        str(db_path),
-        decay_half_life_s=float(memory_cfg["decay_half_life_s"]),
-        min_decay_weight=float(memory_cfg["min_decay_weight"]),
-        max_entries=int(memory_cfg["max_entries"]),
-        match_radius_m=float(memory_cfg["match_radius_m"]),
-        dynamic_labels=frozenset(memory_cfg["dynamic_labels"]),
+    # Class-aware decay + reinforcement across journeys (config memory:).
+    memory = RouteMemory.from_config(
+        memory_cfg,
+        db_path=str(db_path),
         session_id=session_id,
         now_fn=memory_clock,
     )

@@ -29,6 +29,19 @@ def test_repo_config_loads_with_planner_branch_safety_margin():
     assert config["perception"]["weights"] == "best.pt"
 
 
+def test_memory_config_builds_route_memory(tmp_path):
+    from navigation.memory import RouteMemory
+
+    memory_cfg = load_config()["memory"]
+    assert set(memory_cfg["categories"]) == {"dynamic", "temporary", "permanent"}
+    assert memory_cfg["default_half_life_s"] == 3600
+    assert memory_cfg["reinforce_per_session"] == 0.5
+    assert memory_cfg["reinforce_max"] == 3.0
+    memory = RouteMemory.from_config(memory_cfg, db_path=str(tmp_path / "m.db"))
+    assert memory.half_life_for("stairs") == 1_209_600.0
+    assert memory.reinforce_max == 3.0
+
+
 @pytest.mark.parametrize(
     "section, cls",
     [

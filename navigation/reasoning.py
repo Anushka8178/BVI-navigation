@@ -6,6 +6,13 @@ from .memory import HazardEntry
 
 
 class AcousticAttention:
+    """Top-k ranking of remembered hazards for sonification.
+
+    priority = w_distance / (1 + distance) + w_alignment * alignment
+               + w_recency * trust, where trust = decay_weight * belief
+    (time decay x existence belief from negative evidence).
+    """
+
     def __init__(self, top_k: int = 3, weights: tuple[float, float, float] = (0.45, 0.25, 0.30)) -> None:
         self.top_k = top_k
         self.w_distance, self.w_alignment, self.w_recency = weights
@@ -20,7 +27,7 @@ class AcousticAttention:
             entry.priority = (
                 self.w_distance * (1.0 / (1.0 + distance))
                 + self.w_alignment * alignment
-                + self.w_recency * entry.decay_weight
+                + self.w_recency * entry.decay_weight * entry.belief
             )
         return sorted(entries, key=lambda item: item.priority, reverse=True)[: self.top_k]
 

@@ -58,3 +58,40 @@ Tests added (`tests/test_memory.py`)
   later; live mode uses the wall clock; memory written with it decays correctly.
 
 Result: `python -m pytest -q` gives **154 passed**.
+
+## Task 2: class-aware decay with reinforcement across journeys
+
+What changed
+- `config.yaml` `memory:` now has `categories` (dynamic 10 s, temporary 7200 s,
+  permanent 1209600 s = 14 days), `default_half_life_s: 3600`, `reinforce_per_session: 0.5`,
+  `reinforce_max: 3.0`. `decay_half_life_s: 30` stays as the fallback when `categories`
+  is removed.
+- `navigation/memory.py`
+  - `effective_half_life(base, sessions_seen, per_session, max)` and `decay_weight_for()`
+    are pure functions.
+  - `RouteMemory(categories=, default_half_life_s=, reinforce_per_session=0, reinforce_max=1)`.
+    Constructor defaults give the old behaviour (one half-life, no reinforcement).
+    `half_life_for(label, sessions_seen)`.
+  - `RouteMemory.from_config(memory_cfg, **overrides)`: used by the demo (and the eval
+    tool), so config to constructor wiring lives in one place.
+  - Eviction above `max_entries`: lowest `decay_weight * belief` first, then lowest
+    confidence, then oldest.
+- `navigation/reasoning.py`: `AcousticAttention` recency term = `decay_weight * belief`.
+- Demo: `RouteMemory.from_config(memory_cfg, db_path=..., session_id=..., now_fn=...)`.
+
+Decisions
+- Lifetime until pruning (`min_decay_weight 0.05`) = about 4.32 half-lives: person ~43 s,
+  cone ~8.6 h (x2 after 3 walks), pothole ~60 days.
+- Confidence is the tie-break in eviction (instead of a factor). Without it,
+  `test_max_entries_prunes_lowest_ranked_hazards_first` would become order-dependent.
+- A label listed in two categories is a `ValueError` (a clear config error).
+
+Tests added
+- `tests/test_memory_decay_classes.py`: reinforcement formula + cap; repo config half-lives;
+  the dynamic category equals `dynamic_labels`; a pothole survives 2 simulated days, a person
+  is gone after a minute, a cone after a day; a cone seen on 3 walks outlives one seen once
+  (12 h later: 1/8 vs 1/64); fallback without categories; duplicate label error; eviction
+  order; attention uses belief.
+- `tests/test_config.py`: the memory section builds a `RouteMemory`.
+
+Result: `python -m pytest -q` gives **163 passed**.

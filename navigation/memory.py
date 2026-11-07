@@ -6,7 +6,7 @@ import sqlite3
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Callable
+from typing import Any, Callable, Mapping
 
 
 DEFAULT_HALF_LIFE_S = 30.0
@@ -22,6 +22,30 @@ DEFAULT_DYNAMIC_LABELS = frozenset(
 # Timestamps below this (2001-09-09) are not epoch seconds: older databases
 # stored video time, which restarts at 0 every run.
 EPOCH_MIN_S = 1e9
+
+
+def effective_half_life(
+    base_half_life_s: float,
+    sessions_seen: int,
+    reinforce_per_session: float = 0.0,
+    reinforce_max: float = 1.0,
+) -> float:
+    """Half-life lengthened by sightings on several journeys.
+
+    base x min(1 + reinforce_per_session x (sessions_seen - 1), reinforce_max),
+    never below base: a hazard confirmed on 3 walks is trusted longer than
+    one seen once.
+    """
+    factor = 1.0 + reinforce_per_session * max(int(sessions_seen) - 1, 0)
+    return base_half_life_s * max(1.0, min(factor, reinforce_max))
+
+
+def decay_weight_for(elapsed_s: float, half_life_s: float) -> float:
+    """0.5 ** (elapsed / half_life); a zero half-life forgets at once."""
+    elapsed_s = max(elapsed_s, 0.0)
+    if half_life_s > 0:
+        return 0.5 ** (elapsed_s / half_life_s)
+    return 1.0 if elapsed_s <= 0 else 0.0
 
 
 class SessionClock:
@@ -101,18 +125,22 @@ class RouteMemory:
 
     - Time decay: every time memory is touched, each hazard's
       `decay_weight` is recomputed as an exponential function of how long
-      it has been since that hazard was last (re)observed. `decay_weight`
-      halves every `decay_half_life_s` seconds of "silence" on that
-      object, then feeds straight into `AcousticAttention.rank()`'s
-      recency term (navigation/reasoning.py), so long-unseen hazards
-      naturally sink in the ranking instead of sitting at a fixed 1.0
-      forever.
+      it has been since that hazard was last (re)observed. It halves
+      every *effective half-life* of "silence" on that object, then feeds
+      `AcousticAttention.rank()`'s recency/trust term
+      (navigation/reasoning.py), so long-unseen hazards sink in the
+      ranking instead of sitting at a fixed 1.0 forever.
+      The half-life is class-aware (`categories`: a person fades in
+      seconds, a cone in hours, a pothole in weeks) and grows with the
+      number of journeys the hazard was seen on (`reinforce_per_session`,
+      capped at `reinforce_max`). Without `categories`, every label uses
+      `decay_half_life_s` (the original behaviour).
     - Pruning: once a hazard's decay_weight drops below
       `min_decay_weight` it is treated as forgotten and deleted.
       Independently, if the table still holds more than `max_entries`
       rows (e.g. a long walk with many distinct tracked objects), the
-      lowest-ranked surviving rows (decay_weight * confidence) are
-      evicted until the cap is respected.
+      least trusted rows (lowest decay_weight * belief, then lowest
+      confidence) are evicted until the cap is respected.
 
     Clock: timestamps are wall-clock epoch seconds (see SessionClock).
     "Now" comes from `now_fn` (default `time.time`); tests and the
@@ -184,6 +212,10 @@ class RouteMemory:
         dynamic_labels: frozenset[str] | set[str] = DEFAULT_DYNAMIC_LABELS,
         session_id: str | None = None,
         now_fn: Callable[[], float] = time.time,
+        categories: Mapping[str, Mapping[str, Any]] | None = None,
+        default_half_life_s: float | None = None,
+        reinforce_per_session: float = 0.0,
+        reinforce_max: float = 1.0,
     ) -> None:
         self.db_path = db_path
         self.decay_half_life_s = decay_half_life_s
@@ -193,9 +225,66 @@ class RouteMemory:
         self.dynamic_labels = frozenset(dynamic_labels)
         self.session_id = session_id or uuid.uuid4().hex
         self.now_fn = now_fn
+        self.reinforce_per_session = float(reinforce_per_session)
+        self.reinforce_max = float(reinforce_max)
+        # Labels in no category (or every label, without categories).
+        self.default_half_life_s = float(
+            decay_half_life_s
+            if categories is None or default_half_life_s is None
+            else default_half_life_s
+        )
+        self.label_half_life_s: dict[str, float] = {}
+        self.label_category: dict[str, str] = {}
+        for name, spec in (categories or {}).items():
+            for label in spec.get("labels", []):
+                if label in self.label_category:
+                    raise ValueError(
+                        f"memory.categories: label '{label}' is in both "
+                        f"'{self.label_category[label]}' and '{name}'"
+                    )
+                self.label_category[label] = name
+                self.label_half_life_s[label] = float(spec["half_life_s"])
         # Track id -> hazard_id, for this run only (YOLO ids restart per run).
         self._track_to_hazard: dict[str, str] = {}
         self._create_table()
+
+    @classmethod
+    def from_config(cls, memory_cfg: Mapping[str, Any], **kwargs: Any) -> "RouteMemory":
+        """Build from config.yaml's `memory:` section.
+
+        kwargs (e.g. db_path, session_id, now_fn) override the section.
+        Without `categories`, decay falls back to one `decay_half_life_s`
+        for every label and no reinforcement.
+        """
+        categories = memory_cfg.get("categories")
+        options: dict[str, Any] = dict(
+            db_path=str(memory_cfg["db_path"]),
+            decay_half_life_s=float(memory_cfg.get("decay_half_life_s", DEFAULT_HALF_LIFE_S)),
+            min_decay_weight=float(memory_cfg["min_decay_weight"]),
+            max_entries=int(memory_cfg["max_entries"]),
+            match_radius_m=float(memory_cfg["match_radius_m"]),
+            dynamic_labels=frozenset(memory_cfg["dynamic_labels"]),
+        )
+        if categories:
+            options.update(
+                categories=categories,
+                default_half_life_s=float(
+                    memory_cfg.get("default_half_life_s", options["decay_half_life_s"])
+                ),
+                reinforce_per_session=float(memory_cfg.get("reinforce_per_session", 0.0)),
+                reinforce_max=float(memory_cfg.get("reinforce_max", 1.0)),
+            )
+        options.update(kwargs)
+        return cls(**options)
+
+    def half_life_for(self, label: str, sessions_seen: int = 1) -> float:
+        """Effective half-life (s) of a hazard with this label."""
+        return effective_half_life(
+            self.label_half_life_s.get(label, self.default_half_life_s),
+            sessions_seen,
+            self.reinforce_per_session,
+            self.reinforce_max,
+        )
 
     def _connect(self) -> sqlite3.Connection:
         return sqlite3.connect(self.db_path)
@@ -480,14 +569,14 @@ class RouteMemory:
             return self._decay_and_prune(connection, now)
 
     def _decay_and_prune(self, connection: sqlite3.Connection, now: float) -> int:
-        rows = connection.execute("SELECT hazard_id, timestamp FROM hazards").fetchall()
+        rows = connection.execute(
+            "SELECT hazard_id, label, timestamp, sessions_seen FROM hazards"
+        ).fetchall()
         updates = []
-        for hazard_id, entry_timestamp in rows:
-            elapsed = max(now - entry_timestamp, 0.0)
-            if self.decay_half_life_s > 0:
-                decay_weight = 0.5 ** (elapsed / self.decay_half_life_s)
-            else:
-                decay_weight = 1.0 if elapsed <= 0 else 0.0
+        for hazard_id, label, entry_timestamp, sessions_seen in rows:
+            decay_weight = decay_weight_for(
+                now - entry_timestamp, self.half_life_for(label, sessions_seen)
+            )
             updates.append((decay_weight, hazard_id))
         connection.executemany(
             "UPDATE hazards SET decay_weight = ? WHERE hazard_id = ?", updates
@@ -505,7 +594,7 @@ class RouteMemory:
             stale_rows = connection.execute(
                 """
                 SELECT hazard_id FROM hazards
-                ORDER BY (decay_weight * confidence) ASC, timestamp ASC
+                ORDER BY (decay_weight * belief) ASC, confidence ASC, timestamp ASC
                 LIMIT ?
                 """,
                 (overflow,),

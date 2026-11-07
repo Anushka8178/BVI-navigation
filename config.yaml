@@ -112,6 +112,20 @@ trajectory:
 # ------------------------------------------------------------------
 memory:
   db_path: navigation_memory.db
+  # Class-aware decay: decay_weight = 0.5 ** (seconds since last seen /
+  # effective half-life), effective half-life = category half_life_s x
+  # min(1 + reinforce_per_session x (sessions_seen - 1), reinforce_max).
+  # A hazard is deleted once decay_weight < min_decay_weight (0.05), i.e.
+  # after about 4.3 half-lives: person ~43 s, cone ~8.6 h, pothole ~60 days.
+  categories:
+    dynamic:   {half_life_s: 10,      labels: [person, dog, bicycle, car, bus, truck, motorbike, tricycle, autorickshaw, animal]}
+    temporary: {half_life_s: 7200,    labels: [reflective_cone, barrier, spherical_roadblock, warning_column, ashcan]}
+    permanent: {half_life_s: 1209600, labels: [pothole, stairs, curb, drain, pole, tree, fire_hydrant, stop_sign]}
+  default_half_life_s: 3600    # labels in no category
+  reinforce_per_session: 0.5   # half-life x (1 + 0.5 x (sessions_seen - 1)) ...
+  reinforce_max: 3.0           # ... capped at x3
+  # Backward-compatible fallback: one half-life for every label, used only
+  # if `categories` is removed.
   decay_half_life_s: 30.0
   min_decay_weight: 0.05
   max_entries: 500
