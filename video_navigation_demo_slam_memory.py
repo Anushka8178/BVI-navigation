@@ -11,10 +11,14 @@ Pipeline:
       -> urgent HRTF or soft path-guidance HRTF
       -> annotated video + JSON report
 
-Pose (--pose): "phone" reads heading + steps from the SensorServer app on
-the chest-mounted phone (default for stream URLs); "sim" uses a simulated
-walk (default for video files). While the phone pose is invalid (no sensor
-data for pose.stale_after_s), nothing is written to persistent memory.
+Pose (--pose): "slam" runs the visual SLAM in navigation/vslam.py on the
+camera frames (phone steps/heading help with scale and heading when the
+SensorServer app is reachable; --no-phone for camera only); "phone" reads
+heading + steps from the SensorServer app on the chest-mounted phone
+(default for stream URLs); "sim" uses a simulated walk (default for video
+files). While the pose is invalid (no sensor data, SLAM lost without the
+phone, or SLAM still relocalizing in a saved map), nothing is written to
+persistent memory.
 
 All tunables come from config.yaml (see --config). Dedicated flags such as
 --confidence, and any number of --set section.key=value, override it.
@@ -26,6 +30,13 @@ Examples (PowerShell):
 
     # Live phone camera (IP Webcam app); default source is camera.source
     python video_navigation_demo_slam_memory.py --no-display
+
+    # Live with visual SLAM (map saved to slam_map.npz, reused next run)
+    python video_navigation_demo_slam_memory.py --pose slam
+
+    # Recorded video with visual SLAM, camera only, fresh map
+    python video_navigation_demo_slam_memory.py --source videos\\walk.mp4 `
+        --pose slam --no-phone --slam-new-map --reset
 
 Weights default to perception.weights in config.yaml (best.pt).
 """
@@ -53,12 +64,19 @@ from navigation.config import (
 from navigation.hazard import HazardSeverityClassifier
 from navigation.hrtf_renderer import HRTFRenderer
 from navigation.memory import RouteMemory
+from navigation.minimap import draw_minimap
 from navigation.models import FramePacket, Pose
 from navigation.planner import LocalPathPlanner
 from navigation.range_sensor import RangeSensor
 from navigation.reasoning import AcousticAttention
 from navigation.sensing import PhonePose, localize_detection, simulated_pose
 from navigation.trajectory import HazardTrajectoryTracker
+from navigation.vslam import (
+    SlamConfig,
+    VisualSLAM,
+    boxes_from_yolo_result,
+    relative,
+)
 from navigation.yolo_perception import YOLOPerception
 
 
@@ -204,10 +222,38 @@ def main() -> None:
     )
     parser.add_argument(
         "--pose",
-        choices=("sim", "phone"),
+        choices=("sim", "phone", "slam"),
         default=None,
-        help="Pose source: phone = SensorServer app (heading + steps), "
-        "sim = simulated walk (default: phone for stream URLs, sim for files)",
+        help="Pose source: slam = visual SLAM on the camera frames (+ phone "
+        "steps/heading if reachable), phone = SensorServer app (heading + "
+        "steps), sim = simulated walk (default: phone for stream URLs, sim "
+        "for files)",
+    )
+    parser.add_argument(
+        "--slam-map",
+        type=Path,
+        default=None,
+        help="SLAM map file (config: slam.map_path). Loaded at start to "
+        "relocalize in the same world frame as earlier runs; saved at the end",
+    )
+    parser.add_argument(
+        "--slam-new-map",
+        action="store_true",
+        help="Ignore an existing SLAM map and start a new one (it is "
+        "overwritten at the end). Use --reset too: old hazards would be in "
+        "the old map's frame",
+    )
+    parser.add_argument(
+        "--no-phone",
+        action="store_true",
+        help="With --pose slam: do not use the phone's SensorServer data "
+        "(scale then comes from slam.assumed_speed_m_s)",
+    )
+    parser.add_argument(
+        "--trajectory-out",
+        type=Path,
+        default=None,
+        help="Write the per-frame pose to this CSV (for tools/eval_walk_drift.py)",
     )
     parser.add_argument(
         "--config",
@@ -320,6 +366,9 @@ def main() -> None:
                 "audio.hrtf_path": None if args.hrtf is None else str(args.hrtf),
                 "audio.device": args.audio_device,
                 "esp32.serial_port": args.esp32_port,
+                "slam.map_path": (
+                    None if args.slam_map is None else str(args.slam_map)
+                ),
             },
         )
     except ConfigError as error:
@@ -332,6 +381,7 @@ def main() -> None:
     audio_cfg = config["audio"]
     pose_cfg = config["pose"]
     network_cfg = config["network"]
+    slam_cfg = config["slam"]
 
     source = str(camera_cfg["source"])
     live = is_url(source)
@@ -438,7 +488,8 @@ def main() -> None:
 
     phone_pose: PhonePose | None = None
 
-    if pose_mode == "phone":
+    use_phone = pose_mode == "phone" or (pose_mode == "slam" and not args.no_phone)
+    if use_phone:
         phone_pose = PhonePose.from_config(network_cfg, pose_cfg)
         print(
             "Connecting to phone sensors at "
@@ -447,14 +498,28 @@ def main() -> None:
         try:
             phone_pose.start()
         except RuntimeError as error:
-            frame_source.close()
-            if hrtf_renderer is not None:
-                hrtf_renderer.close()
-            raise SystemExit(f"Phone pose setup failed: {error}") from error
+            if pose_mode == "slam":
+                print(
+                    f"WARNING: phone sensors unavailable ({error}); SLAM runs "
+                    "camera-only, scale from slam.assumed_speed_m_s.\n"
+                )
+                phone_pose = None
+            else:
+                frame_source.close()
+                if hrtf_renderer is not None:
+                    hrtf_renderer.close()
+                raise SystemExit(f"Phone pose setup failed: {error}") from error
 
+    if phone_pose is not None:
         if phone_pose.wait_for_heading(float(pose_cfg["startup_wait_s"])):
             phone_pose.calibrate()
             print("Phone pose ready; current heading set as 0.\n")
+        elif pose_mode == "slam":
+            print(
+                "WARNING: no rotation data from the phone yet. SLAM continues "
+                "with the camera; phone steps/heading are used once they "
+                "arrive.\n"
+            )
         else:
             print(
                 "WARNING: no rotation data from the phone yet. Check the "
@@ -462,8 +527,35 @@ def main() -> None:
                 "--pose sim. Continuing; memory is paused until the pose is "
                 "valid, and the first heading becomes 0.\n"
             )
-    else:
+
+    # Visual SLAM is created on the first frame (needs the frame size).
+    slam: VisualSLAM | None = None
+    slam_config = SlamConfig.from_config(slam_cfg)
+    slam_map_path = Path(slam_cfg["map_path"])
+    slam_every_n = max(1, int(slam_cfg["process_every_n"]))
+    slam_map_version = 0
+    slam_seconds = 0.0
+    slam_frames = 0
+    reanchored_total = 0
+    dynamic_labels = frozenset(memory_cfg["dynamic_labels"])
+    if pose_mode == "slam":
+        print(
+            "Pose: visual SLAM"
+            + (" + phone steps/heading" if phone_pose is not None else " (camera only)")
+            + f"; map file {slam_map_path}"
+            + (" (new map)" if args.slam_new_map else "")
+            + "\n"
+        )
+        if args.slam_new_map and not args.reset:
+            print(
+                "NOTE: --slam-new-map without --reset: hazards already in "
+                "memory are in the old map's frame.\n"
+            )
+    elif pose_mode == "sim":
         print("Pose: simulated walk (--pose sim).\n")
+
+    trajectory_rows: list[tuple[float, float, float, float, int, str]] = []
+    trajectory_xy: list[tuple[float, float]] = []
 
     # Range sensor: started and stopped only for now (fusion comes later).
     # A missing port prints one warning; the run continues without it.
@@ -550,7 +642,40 @@ def main() -> None:
                 image=image,
             )
 
-            if phone_pose is not None:
+            detections = perception.process(frame_packet)
+
+            if pose_mode == "slam":
+                if slam is None:
+                    frame_h, frame_w = image.shape[:2]
+                    try:
+                        slam = VisualSLAM(
+                            slam_config,
+                            (frame_w, frame_h),
+                            helper=phone_pose,
+                            map_path=slam_map_path,
+                            new_map=args.slam_new_map,
+                        )
+                    except ValueError as error:
+                        raise SystemExit(f"SLAM map error: {error}") from error
+                if (frame_id - 1) % slam_every_n == 0:
+                    slam_started = time.perf_counter()
+                    pose = slam.process(
+                        image,
+                        timestamp,
+                        boxes_from_yolo_result(perception.last_result, dynamic_labels),
+                    )
+                    slam_seconds += time.perf_counter() - slam_started
+                    slam_frames += 1
+                else:
+                    pose = slam.get_pose(timestamp)
+                if slam.map_version != slam_map_version:
+                    # Loop closure moved keyframes: move anchored hazards too.
+                    slam_map_version = slam.map_version
+                    moved = memory.reanchor(slam.anchor_poses())
+                    reanchored_total += moved
+                    if moved:
+                        print(f"SLAM | moved {moved} remembered hazard(s) with the corrected map")
+            elif phone_pose is not None:
                 pose = phone_pose.get_pose(timestamp)
             else:
                 pose = simulated_pose(elapsed_s)
@@ -562,11 +687,23 @@ def main() -> None:
                     print(
                         "POSE | valid, memory writing resumed"
                         if pose.valid
-                        else "POSE | INVALID (no phone sensor data), "
-                        "memory writing paused"
+                        else "POSE | INVALID ("
+                        + (
+                            f"SLAM {slam.state}"
+                            if slam is not None
+                            else "no phone sensor data"
+                        )
+                        + "), memory writing paused"
                     )
                 pose_was_valid = pose.valid
-            detections = perception.process(frame_packet)
+
+            slam_state = slam.state if slam is not None else pose_mode.upper()
+            trajectory_rows.append(
+                (round(elapsed_s, 3), pose.x, pose.y, pose.heading_deg, int(pose.valid), slam_state)
+            )
+            if pose.valid:
+                trajectory_xy.append((pose.x, pose.y))
+            anchor_kf = slam.current_anchor() if slam is not None else None
 
             # -------------------------------------------------
             # Current-frame hazards
@@ -600,6 +737,17 @@ def main() -> None:
                     velocity_y=track.velocity_y,
                     # Invalid pose: world position unknown, don't store it.
                     persist=pose.valid,
+                    anchor=(
+                        None
+                        if anchor_kf is None
+                        else (
+                            anchor_kf[0],
+                            *relative(
+                                anchor_kf[1],
+                                (localized.world_x, localized.world_y, 0.0),
+                            )[:2],
+                        )
+                    ),
                 )
 
                 current_frame_hazards.append(entry)
@@ -749,6 +897,39 @@ def main() -> None:
                 pose_mode=pose_mode,
             )
 
+            draw_minimap(
+                display,
+                (
+                    # SLAM: the keyframe chain is the corrected path.
+                    [
+                        (kf.pose[0], kf.pose[1])
+                        for kf in sorted(slam.keyframes.values(), key=lambda k: k.kf_id)
+                        if kf.kf_id >= slam.loaded_keyframes
+                    ]
+                    + [(pose.x, pose.y)]
+                    if slam is not None
+                    else trajectory_xy[-2000:]
+                ),
+                (
+                    [(kf.pose[0], kf.pose[1]) for kf in slam.keyframes.values()]
+                    if slam is not None
+                    else []
+                ),
+                slam.loop_edges() if slam is not None else [],
+                [
+                    (h.world_x, h.world_y, h.label, h.decay_weight)
+                    for h in memory.get_hazards()[:40]
+                ],
+                (pose.x, pose.y, pose.heading_deg),
+                slam_state,
+                info=(
+                    f"kf {len(slam.keyframes)}  loops {slam.loop_closures}  "
+                    f"inl {slam.last_inliers}"
+                    if slam is not None
+                    else ""
+                ),
+            )
+
             writer.write(display)
 
             # -------------------------------------------------
@@ -857,6 +1038,19 @@ def main() -> None:
         if range_sensor is not None:
             range_sensor.close()
 
+        if slam is not None and slam.keyframes:
+            slam.save_map(slam_map_path)
+            print(f"SLAM map saved: {slam_map_path.resolve()} ({len(slam.keyframes)} keyframes)")
+
+    if args.trajectory_out is not None and trajectory_rows:
+        args.trajectory_out.parent.mkdir(parents=True, exist_ok=True)
+        lines = ["time_s,x,y,heading_deg,valid,state"]
+        lines += [
+            f"{t},{x:.4f},{y:.4f},{h:.3f},{v},{st}" for t, x, y, h, v, st in trajectory_rows
+        ]
+        args.trajectory_out.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        print(f"Trajectory CSV: {args.trajectory_out.resolve()}")
+
     processing_seconds = time.perf_counter() - processing_started
     persisted_hazards = memory.get_hazards()
 
@@ -878,6 +1072,28 @@ def main() -> None:
         "path_warning_audio_played": path_warning_audio_count,
         "frames_processed": frame_id,
         "invalid_pose_frames": invalid_pose_frames,
+        "slam": (
+            None
+            if slam is None
+            else {
+                "map_file": str(slam_map_path.resolve()),
+                "map_id": slam.map_id,
+                "keyframes": len(slam.keyframes),
+                "keyframes_loaded_from_earlier_runs": slam.loaded_keyframes,
+                "loop_closures": slam.loop_closures,
+                "relocalizations": slam.relocalizations,
+                "hazards_moved_by_map_corrections": reanchored_total,
+                "final_state": slam.state,
+                "frames_processed_by_slam": slam_frames,
+                "mean_slam_ms_per_frame": (
+                    round(1000 * slam_seconds / slam_frames, 1) if slam_frames else None
+                ),
+                "events": [
+                    {"time": round(e.timestamp, 3), "kind": e.kind, "detail": e.detail}
+                    for e in slam.events
+                ],
+            }
+        ),
         "video_fps": fps,
         "warning_frames": warning_frames,
         "unique_warning_objects": len(unique_warning_ids),
@@ -923,6 +1139,11 @@ def main() -> None:
                 "Pose is phone heading + step counting (stride from config); "
                 "position drifts over long walks."
                 if pose_mode == "phone"
+                else "Pose is lightweight monocular visual SLAM (2D ground-plane "
+                "pose, ORB visual odometry, loop closure, saved map); metric "
+                "scale comes from phone steps or an assumed walking speed, and "
+                "tracking can fail in low texture, low light or fast turns."
+                if pose_mode == "slam"
                 else "Pose comes from a deterministic simulated trajectory, "
                 "not real localization."
             ),

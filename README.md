@@ -169,6 +169,81 @@ reasoning) can be built and demonstrated against a stable interface before
 a real SLAM system (RealSense RGB-D + IMU → RTAB-Map/ORB-SLAM3 → `Pose`)
 is dropped in — see `navigation/sensing.py`'s own docstring.
 
+## Visual SLAM (`--pose slam`)
+
+`navigation/vslam.py` is a **real, lightweight keyframe monocular visual SLAM**
+that runs on the laptop (OpenCV + NumPy + SciPy only, no phone app, no ROS).
+It replaces the simulated pose and improves on phone dead reckoning, behind the
+same `Pose` interface, so hazard triage, planner, memory, attention and HRTF are
+unchanged.
+
+| Part | What it does |
+| --- | --- |
+| Tracking | ORB features (grid-spread) matched to the current keyframe; essential matrix (RANSAC) gives rotation + translation direction. Features on dynamic YOLO boxes (people, vehicles, animals) are masked out. |
+| Scale | Metric distance from the phone's step counter (steps x `pose.stride_m`); camera-only runs use `slam.assumed_speed_m_s`. |
+| Heading | Visual yaw, pulled gently towards the phone's rotation-vector heading at each keyframe. |
+| Map | Keyframes: pose + ORB features + a thumbnail for place recognition. |
+| Loop closure | A revisited place is recognized, its metric relative pose measured (triangulation + PnP), and a 2D pose graph is optimized (SciPy least squares). A loop that would tear the odometry apart is rejected. |
+| Hazard re-anchoring | Each remembered hazard stores the keyframe it was seen from; when loop closure moves keyframes, `RouteMemory.reanchor()` moves the hazards too. |
+| Saved map + relocalization | The map is saved to `slam.map_path` (`slam_map.npz`). The next run recognizes where it is in that map and continues in **the same world frame**, so hazards in persistent memory line up across walks. Memory writing is paused until then. |
+| Tracking loss | Falls back to phone dead reckoning (if connected) while trying to re-find a keyframe; without the phone the pose is invalid (alerts continue, memory pauses). |
+
+Run it:
+
+```powershell
+# Live (IP Webcam + SensorServer). First run builds the map; later runs reuse it.
+python video_navigation_demo_slam_memory.py --pose slam --trajectory-out runs\walk.csv
+
+# Start fresh (new map + empty memory)
+python video_navigation_demo_slam_memory.py --pose slam --slam-new-map --reset
+
+# Recorded video, camera only
+python video_navigation_demo_slam_memory.py --source videos\walk.mp4 --pose slam --no-phone --slam-new-map --reset
+```
+
+The annotated video has a mini-map (bottom right): keyframe path, loop-closure
+links, remembered hazards and the SLAM state (TRACKING / RELOCALIZING / LOST).
+The JSON report has a `slam` block (keyframes, loop closures, relocalizations,
+hazards moved, events, ms per frame).
+
+For relocalization to work, **start each walk where an earlier walk passed**,
+ideally at the same taped start mark facing the same way.
+
+Calibrate the camera once (better accuracy than the `slam.hfov_deg` guess):
+`python scripts/manual/calibrate_camera.py --source http://<PHONE_IP>:8080/video`,
+then paste the printed `fx, fy, cx, cy, calib_width` into `config.yaml`.
+
+Evaluation tools:
+
+```powershell
+# Simulation: SLAM vs phone dead reckoning on a known square path (no hardware)
+python tools/simulate_slam_walk.py --laps 2 --video runs\sim_slam.mp4
+
+# Our own walks: drift of a closed loop for each pose source
+python tools/eval_walk_drift.py runs\loop_phone.csv runs\loop_slam.csv --png runs\loop.png
+
+# TUM RGB-D benchmark (planar pioneer sequences fit the 2D model best)
+python tools/eval_slam_tum.py C:\data\rgbd_dataset_freiburg2_pioneer_slam --camera fr2 --out runs\tum
+```
+
+Simulation result (`tools/simulate_slam_walk.py --laps 2`: 64 m, 7 % stride
+error, phone heading drift 0.3 deg/s): end-point error 0.13 m with SLAM vs
+1.58 m with phone dead reckoning (drift 0.2 % vs 2.5 %), 31 loop closures.
+
+SLAM limitations (state them honestly):
+
+- Monocular, 2D ground-plane pose (x, y, heading); assumes roughly flat ground.
+  No bundle adjustment or 3D map, so it is far simpler than ORB-SLAM3.
+- Metric scale is only as good as the step length (`pose.stride_m`) or the
+  assumed speed; loop closure cannot fix a wrong stride.
+- A pure sideways step in front of distant surfaces looks like a small turn
+  to one camera; the walking-forward assumption covers normal walking.
+- Relocalization works best within a few metres of where an earlier walk
+  passed, facing a similar direction.
+- Low texture (blank walls), low light, motion blur and very fast turns can
+  lose tracking.
+- Not yet evaluated on TUM / EuRoC or real campus walks: run the tools above.
+
 ## Verifying persistent memory with SQL
 
 `video_navigation_demo_slam_memory.py` writes to `navigation_memory.db`, a
@@ -235,9 +310,10 @@ python -c "import sqlite3; c = sqlite3.connect('navigation_memory.db'); c.row_fa
 - Positions are already expressed as relative 3D coordinates; no calibrated depth reconstruction is performed.
 - Audio is represented as structured console events, not true HRTF waveforms.
 - Route planning compares two predefined route candidates rather than a full semantic map.
-- `video_navigation_demo_slam_memory.py`'s pose comes from a deterministic
-  simulated trajectory (`simulated_pose()` / `navigation/sensing.py`), not
-  real camera-based localization.
+- `video_navigation_demo_slam_memory.py`'s pose: `--pose slam` is real
+  camera-based visual SLAM (see "Visual SLAM" above for its limits),
+  `--pose phone` is phone dead reckoning, `--pose sim` is a deterministic
+  simulated trajectory.
 - YOLO's tracker can assign a new ID to the same physical object after
   occlusion or brief loss of track, so persistent-memory object counts can
   run higher than the number of distinct real-world objects actually

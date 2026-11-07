@@ -89,9 +89,19 @@ class RouteMemory:
             timestamp REAL NOT NULL,
             decay_weight REAL NOT NULL DEFAULT 1.0,
             velocity_x REAL NOT NULL DEFAULT 0.0,
-            velocity_y REAL NOT NULL DEFAULT 0.0
+            velocity_y REAL NOT NULL DEFAULT 0.0,
+            anchor TEXT,
+            anchor_right REAL,
+            anchor_forward REAL
         )
     """
+
+    # Columns added after the hazard_id schema; ALTERed into older tables.
+    _ANCHOR_COLUMNS = (
+        ("anchor", "TEXT"),
+        ("anchor_right", "REAL"),
+        ("anchor_forward", "REAL"),
+    )
 
     def __init__(
         self,
@@ -128,6 +138,14 @@ class RouteMemory:
                 self._migrate_legacy_table(connection, columns)
             else:
                 connection.execute(self._CREATE_SQL)
+
+            present = {
+                row[1]
+                for row in connection.execute("PRAGMA table_info(hazards)").fetchall()
+            }
+            for name, kind in self._ANCHOR_COLUMNS:
+                if name not in present:
+                    connection.execute(f"ALTER TABLE hazards ADD COLUMN {name} {kind}")
 
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_hazards_label ON hazards(label)"
@@ -229,6 +247,7 @@ class RouteMemory:
         velocity_x: float = 0.0,
         velocity_y: float = 0.0,
         persist: bool = True,
+        anchor: tuple[str, float, float] | None = None,
     ) -> HazardEntry:
         """Save a detection, merging it into an existing hazard if it matches.
 
@@ -245,6 +264,11 @@ class RouteMemory:
         A freshly (re)observed hazard is written with a full decay_weight
         of 1.0. Every call also ages and prunes the rest of memory relative
         to this timestamp, so the table stays bounded.
+
+        `anchor` = (keyframe anchor id, right_m, forward_m): the hazard's
+        position relative to the SLAM keyframe it was seen from. After a
+        loop closure moves that keyframe, `reanchor()` moves the hazard
+        with it. None (phone/sim pose) leaves the hazard unanchored.
         """
 
         if timestamp is None:
@@ -285,9 +309,12 @@ class RouteMemory:
                     timestamp,
                     decay_weight,
                     velocity_x,
-                    velocity_y
+                    velocity_y,
+                    anchor,
+                    anchor_right,
+                    anchor_forward
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(hazard_id) DO UPDATE SET
                     object_id = excluded.object_id,
                     label = excluded.label,
@@ -297,7 +324,10 @@ class RouteMemory:
                     timestamp = excluded.timestamp,
                     decay_weight = excluded.decay_weight,
                     velocity_x = excluded.velocity_x,
-                    velocity_y = excluded.velocity_y
+                    velocity_y = excluded.velocity_y,
+                    anchor = excluded.anchor,
+                    anchor_right = excluded.anchor_right,
+                    anchor_forward = excluded.anchor_forward
                 """,
                 (
                     hazard_id,
@@ -310,6 +340,9 @@ class RouteMemory:
                     decay_weight,
                     velocity_x,
                     velocity_y,
+                    None if anchor is None else anchor[0],
+                    None if anchor is None else float(anchor[1]),
+                    None if anchor is None else float(anchor[2]),
                 ),
             )
 
@@ -424,6 +457,38 @@ class RouteMemory:
             )
             for row in rows
         ]
+
+    def reanchor(self, anchor_poses: dict[str, tuple[float, float, float]]) -> int:
+        """Move anchored hazards with their SLAM keyframes.
+
+        `anchor_poses` maps anchor id -> corrected keyframe pose
+        (x, y, heading_deg). Each anchored hazard's world position is
+        recomputed from its stored keyframe-relative offset (CLAUDE.md
+        local_to_world). Hazards whose anchor is unknown (other map, or
+        no anchor) are left alone. Returns the number of rows moved.
+        """
+        moved = 0
+        with contextlib.closing(self._connect()) as connection, connection:
+            rows = connection.execute(
+                """
+                SELECT hazard_id, anchor, anchor_right, anchor_forward
+                FROM hazards WHERE anchor IS NOT NULL
+                """
+            ).fetchall()
+            for hazard_id, anchor, right, forward in rows:
+                pose = anchor_poses.get(anchor)
+                if pose is None:
+                    continue
+                x, y, heading = pose
+                h = math.radians(heading)
+                world_x = x + right * math.cos(h) + forward * math.sin(h)
+                world_y = y - right * math.sin(h) + forward * math.cos(h)
+                connection.execute(
+                    "UPDATE hazards SET world_x = ?, world_y = ? WHERE hazard_id = ?",
+                    (world_x, world_y, hazard_id),
+                )
+                moved += 1
+        return moved
 
     def clear(self) -> None:
         """Delete all remembered hazards. Mainly useful for tests."""

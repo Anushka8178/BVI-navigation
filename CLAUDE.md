@@ -42,7 +42,15 @@ big refactors. Do not add heavy new dependencies. Do not rewrite modules that al
     physical→SOFA azimuth conversion, with path guidance played at the *walking* direction.
 - Main entry point: `video_navigation_demo_slam_memory.py`.
 - Modules: `navigation/` (models, yolo_perception, hazard, sensing, memory, planner, trajectory,
-  reasoning, audio, hrtf_renderer). HRTF file: `hrtf/mit_kemar_normal_pinna.sofa`.
+  reasoning, audio, hrtf_renderer, vslam, minimap, slam_eval, synthetic_scene).
+  HRTF file: `hrtf/mit_kemar_normal_pinna.sofa`.
+- **Visual SLAM** (`--pose slam`, `navigation/vslam.py`, config `slam:`): keyframe monocular VO
+  (ORB + essential matrix, dynamic YOLO boxes masked), scale from phone steps (or
+  `slam.assumed_speed_m_s`), heading fused with the phone, loop closure (triangulation + PnP,
+  2D pose graph with SciPy, consistency check), saved map `slam_map.npz` + relocalization so
+  later runs share the world frame. Hazards store a keyframe anchor (`anchor`, `anchor_right`,
+  `anchor_forward` columns) and `RouteMemory.reanchor()` moves them after loop closure.
+  `navigation/synthetic_scene.py` renders a textured room for hardware-free SLAM tests.
 - Detector: custom YOLO26 `best.pt`, 23 classes: stop_sign, person, bicycle, bus, truck, car,
   motorbike, reflective_cone, ashcan, warning_column, spherical_roadblock, pole, dog, tricycle,
   fire_hydrant, pothole, stairs, curb, drain, tree, autorickshaw, animal, barrier.
@@ -51,7 +59,8 @@ big refactors. Do not add heavy new dependencies. Do not rewrite modules that al
   Needs `ultralytics>=8.4`.
 
 ## Known bugs to fix (verified in the code)
-1. **Pose doesn't follow the video:** `simulated_pose(t)` invents motion. Replace it with `PhonePose`.
+1. **Pose doesn't follow the video:** `simulated_pose(t)` invents motion. Fixed: use `--pose phone`
+   (dead reckoning) or `--pose slam` (visual SLAM).
 2. **Heading convention mismatch:** `AcousticAttention` uses forward = (sin h, cos h), i.e. heading
    clockwise from +y, but `local_to_world` rotates counter-clockwise, and `simulated_pose` walks along +x
    at heading 0.

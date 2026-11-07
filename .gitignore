@@ -50,3 +50,7 @@ videos/*_navigation*.json
 videos/*_annotated*.json
 /output*.json
 evaluation_*.json
+
+# Visual SLAM maps and trajectories (generated per walk)
+*.npz
+trajectory*.csv
