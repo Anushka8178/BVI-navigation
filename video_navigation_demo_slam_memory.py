@@ -12,7 +12,7 @@ Pipeline:
       -> annotated video + JSON report
 
 Important:
-    Pose/localization is simulated in this prototype. It is not real SLAM.
+    Pose comes from monocular visual odometry (ORB + essential matrix). Not full SLAM: no loop closure, scale is approximate.
 
 Example:
     python video_navigation_demo_slam_memory.py \
@@ -40,6 +40,7 @@ from navigation.hazard import HazardSeverityClassifier
 from navigation.hrtf_renderer import HRTFRenderer
 from navigation.memory import RouteMemory
 from navigation.models import FramePacket, Pose
+from navigation.visual_odometry import MonocularVisualOdometry
 from navigation.planner import LocalPathPlanner
 from navigation.reasoning import AcousticAttention
 from navigation.sensing import localize_detection
@@ -118,7 +119,7 @@ def draw_status(
 
     lines = [
         (
-            f"Pose(sim): x={pose.x:.2f} y={pose.y:.2f} "
+            f"Pose(VO): x={pose.x:.2f} y={pose.y:.2f} "
             f"heading={pose.heading_deg:.1f}°"
         ),
         f"Detections: {detection_count} | Urgent warnings: {len(warnings)}",
@@ -202,7 +203,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--source",
-        type=Path,
+        type=str,
         required=True,
         help="Input recorded video",
     )
@@ -263,9 +264,9 @@ def main() -> None:
             f"Trained model does not exist: {args.weights.resolve()}"
         )
 
-    if not args.source.exists():
+    if not (args.source.startswith(("http://", "https://", "rtsp://")) or Path(args.source).exists()):
         raise SystemExit(
-            f"Input video does not exist: {args.source.resolve()}"
+            f"Input video does not exist: {args.source}"
         )
 
     if not args.no_audio and not args.hrtf.exists():
@@ -274,9 +275,10 @@ def main() -> None:
         )
 
     capture = cv2.VideoCapture(str(args.source))
+    visual_odometry = MonocularVisualOdometry()
     if not capture.isOpened():
         raise SystemExit(
-            f"Could not open input video: {args.source.resolve()}"
+            f"Could not open input video: {args.source}"
         )
 
     fps = float(capture.get(cv2.CAP_PROP_FPS)) or 30.0
@@ -394,7 +396,7 @@ def main() -> None:
                 image=image,
             )
 
-            pose = simulated_pose(timestamp)
+            pose = visual_odometry.update(captured_image, timestamp)
             detections = perception.process(frame_packet)
 
             # -------------------------------------------------
@@ -643,6 +645,7 @@ def main() -> None:
                     
 
             if not args.no_display:
+                visual_odometry.draw_minimap(display)
                 cv2.imshow(
                     "BVI Navigation - YOLO + Path + TTC + HRTF - Q to stop",
                     display,
@@ -664,7 +667,7 @@ def main() -> None:
     persisted_hazards = memory.get_hazards()
 
     report = {
-        "source_video": str(args.source.resolve()),
+        "source_video": str(args.source),
         "model_weights": str(args.weights.resolve()),
         "annotated_video": str(args.output.resolve()),
         "memory_db": str(args.db.resolve()),
@@ -712,7 +715,7 @@ def main() -> None:
         },
         "limitations": [
             "Distance is estimated from object height and bounding-box size, not measured depth.",
-            "Pose comes from a deterministic simulated trajectory, not real SLAM/localization.",
+            "Pose comes from monocular visual odometry (camera-based); scale approximated, no loop closure.",
             "Trajectory velocity is estimated from localized detections and can be noisy.",
             "TTC is a prototype prediction based on estimated relative motion and safety radii.",
             "HRTF uses the nearest horizontal-plane measurement available in the SOFA file.",
