@@ -75,7 +75,7 @@ pose:
 # Perception
 # ------------------------------------------------------------------
 perception:
-  weights: best.pt          # YOLO weights (--weights overrides)
+  weights: "D:/newbvi/runs/detect/runs_bvi/obstacles/weights/best.pt"   # 23-class model (has stairs)          # YOLO weights (--weights overrides)
   confidence: 0.35
   device: cpu                # "cpu" or a CUDA index such as "0"
   # Ground-level classes: distance from the box bottom edge with a

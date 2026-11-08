@@ -117,6 +117,7 @@ class YOLOPerception:
         results = self.model.track(
             source=frame.image,
             persist=True,
+            tracker="bvi_tracker.yaml",
             conf=self.confidence,
             device=self.device,
             verbose=False,
@@ -135,6 +136,10 @@ class YOLOPerception:
         if result.boxes is None:
             return detections
 
+        # Stable IDs already given out in this frame (one object = one ID).
+        self._used_this_frame: set[tuple[str, int]] = set()
+        stable_ids: list[int] = []
+
         for box in result.boxes:
             class_index = int(box.cls.item())
             label = str(result.names[class_index])
@@ -148,10 +153,12 @@ class YOLOPerception:
             pixel_height = max(y2 - y1, 1.0)
             center_x = (x1 + x2) / 2.0
 
-            if box.id is not None:
-                track_id = int(box.id.item())
-            else:
-                track_id = self._fallback_id(label)
+            track_id = self._stable_id(
+                label,
+                int(box.id.item()) if box.id is not None else None,
+                (x1, y1, x2, y2),
+            )
+            stable_ids.append(track_id)
 
             object_id = f"{label}-{track_id}"
 
@@ -201,7 +208,24 @@ class YOLOPerception:
 
             detections.append(detection)
 
+        # Make the on-screen boxes show the same stable IDs as the terminal.
+        self._relabel_result(result, stable_ids)
+
         return detections
+
+    @staticmethod
+    def _relabel_result(result, stable_ids):
+        try:
+            import torch
+
+            boxes = result.boxes
+            if boxes is None or len(boxes) == 0 or len(boxes) != len(stable_ids):
+                return
+            data = boxes.data
+            ids = torch.tensor(stable_ids, dtype=data.dtype, device=data.device).unsqueeze(1)
+            result.update(boxes=torch.cat([data[:, :4], ids, data[:, -2:]], dim=1))
+        except Exception:
+            pass
 
     def _estimate_distance(
         self,
@@ -249,6 +273,84 @@ class YOLOPerception:
             return Motion.APPROACHING
 
         return Motion.STATIC
+
+    # ------------------------------------------------------------------
+    # Stable IDs
+    # ------------------------------------------------------------------
+    # YOLO's tracker often drops or renumbers a track when the pipeline
+    # runs at low FPS. We therefore hand out our OWN stable IDs:
+    #   * a tracker ID, once linked to a stable ID, always maps to it;
+    #   * an untracked box (or a brand-new tracker ID) reuses the stable ID
+    #     of the closest recent box with the same label;
+    #   * a stable ID is remembered for STABLE_ID_MEMORY_S seconds after it
+    #     was last seen, so short occlusions/misses keep the same ID;
+    #   * two boxes in the same frame never share an ID.
+    STABLE_ID_MEMORY_S = 5.0
+    STABLE_ID_MIN_SCORE = 0.3
+
+    def _stable_id(self, label, tracker_id, box):
+        import time
+
+        now = time.monotonic()
+        if not hasattr(self, "_recent_boxes"):
+            self._recent_boxes = {}      # (label, stable_id) -> (box, last_seen)
+            self._tracker_alias = {}     # (label, tracker_id) -> stable_id
+            self._stable_counter = defaultdict(int)
+        if not hasattr(self, "_used_this_frame"):
+            self._used_this_frame = set()
+
+        # Forget objects not seen for a while.
+        for key in [k for k, (_, t) in self._recent_boxes.items()
+                    if now - t > self.STABLE_ID_MEMORY_S]:
+            del self._recent_boxes[key]
+
+        stable = None
+
+        # 1. Tracker ID we have already linked to a stable ID.
+        if tracker_id is not None:
+            stable = self._tracker_alias.get((label, tracker_id))
+            if stable is not None and (label, stable) in self._used_this_frame:
+                stable = None
+
+        # 2. Otherwise: closest recent box of the same label.
+        if stable is None:
+            stable = self._best_match(label, box, now)
+
+        # 3. Otherwise: a genuinely new object.
+        if stable is None:
+            self._stable_counter[label] += 1
+            stable = self._stable_counter[label]
+
+        if tracker_id is not None:
+            self._tracker_alias[(label, tracker_id)] = stable
+        self._recent_boxes[(label, stable)] = (box, now)
+        self._used_this_frame.add((label, stable))
+        return stable
+
+    def _best_match(self, label, box, now):
+        x1, y1, x2, y2 = box
+        cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+        best, best_score = None, 0.0
+        for (lbl, sid), ((a1, b1, a2, b2), seen) in self._recent_boxes.items():
+            if lbl != label or (lbl, sid) in self._used_this_frame:
+                continue
+            ix = max(0.0, min(x2, a2) - max(x1, a1))
+            iy = max(0.0, min(y2, b2) - max(y1, b1))
+            inter = ix * iy
+            union = (x2 - x1) * (y2 - y1) + (a2 - a1) * (b2 - b1) - inter
+            iou = inter / union if union > 0 else 0.0
+            # Centre distance in units of box size (allows big jumps at low FPS).
+            size = max(a2 - a1, b2 - b1, x2 - x1, y2 - y1, 1.0)
+            dist = ((cx - (a1 + a2) / 2) ** 2 + (cy - (b1 + b2) / 2) ** 2) ** 0.5 / size
+            # Similar box size -> more likely the same object.
+            h_old, h_new = max(b2 - b1, 1.0), max(y2 - y1, 1.0)
+            size_ratio = min(h_old, h_new) / max(h_old, h_new)
+            score = max(iou, (1.0 - dist / 1.5)) * (0.5 + 0.5 * size_ratio)
+            # Prefer recently seen objects slightly.
+            score *= 1.0 - 0.1 * min((now - seen) / self.STABLE_ID_MEMORY_S, 1.0)
+            if score > best_score:
+                best, best_score = sid, score
+        return best if best_score >= self.STABLE_ID_MIN_SCORE else None
 
     def _fallback_id(self, label: str) -> int:
         self.fallback_ids[label] += 1
