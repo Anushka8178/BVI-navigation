@@ -8,22 +8,35 @@
  * Each reading is the median of 3 pings (a timeout counts as "no echo",
  * so 2 or more timeouts give -1).
  *
- * Wiring (sensor powered from 3V3, so Echo is already 3.3 V logic and no
- * voltage divider is needed; the 220 ohm resistor is series protection only):
+ * Wiring: the HC-SR04 is powered from the ESP32 VIN pin (5 V from USB),
+ * because it did not range reliably at 3.3 V. At 5 V its Echo output is a
+ * 5 V pulse, and ESP32 GPIOs are NOT 5 V tolerant (3.3 V max), so Echo goes
+ * through a 1k / 2k voltage divider:
+ *     V_pin = 5 V * R2 / (R1 + R2) = 5 V * 2k / 3k ~= 3.3 V
+ * Trig needs no divider: the ESP32 drives it with 3.3 V, which the HC-SR04
+ * reads as HIGH.
  *
  *   HC-SR04 pin | ESP32 pin
- *   ------------+-------------------------
- *   VCC         | 3V3
+ *   ------------+--------------------------------------------------
+ *   VCC         | VIN (5 V)
  *   GND         | GND
- *   Trig        | GPIO5
- *   Echo        | 220R -> GPIO18
+ *   Trig        | GPIO26
+ *   Echo        | R1 = 1k -> GPIO27
+ *               | R2 = 2k (two 1k in series) from GPIO27 -> GND
+ *
+ *       Echo ---[ 1k ]---+--- GPIO27
+ *                        |
+ *                     [ 1k ]
+ *                     [ 1k ]   (R2 = 2k)
+ *                        |
+ *                       GND
  *
  * Mount at chest height facing forward, next to the phone camera.
  * The laptop side is navigation/range_sensor.py (config.yaml: esp32.serial_port).
  */
 
-const int TRIG_PIN = 5;
-const int ECHO_PIN = 18;
+const int TRIG_PIN = 26;
+const int ECHO_PIN = 27;
 
 const unsigned long PERIOD_MS = 66;          // ~15 readings per second
 const unsigned long ECHO_TIMEOUT_US = 30000; // ~5 m round trip

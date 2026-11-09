@@ -28,8 +28,10 @@ Do not rewrite modules that already work.
 - ESP32 prints `D,<distance_cm>,<esp_millis>` about 15 times a second (median of 3 pings).
   If there's no echo, it prints `D,-1,<esp_millis>`. Other lines (boot messages) are ignored.
 - One-way only: the laptop sends nothing to the ESP32.
-- Wiring (sensor powered from 3V3, so no voltage divider; the 220R is series protection only):
-  HC-SR04 VCC → ESP32 3V3, GND → GND, Trig → GPIO5, Echo → 220R → GPIO18.
+- Wiring (sensor powered from 5 V because it was unreliable at 3.3 V; ESP32 GPIOs are not
+  5 V tolerant, so Echo goes through a 1k/2k divider to about 3.3 V):
+  HC-SR04 VCC → ESP32 VIN (5 V), GND → GND, Trig → GPIO26,
+  Echo → R1 1kΩ → GPIO27, with R2 2kΩ (two 1kΩ in series) from GPIO27 → GND.
 - Laptop side: `navigation/range_sensor.py` (`RangeSensor`, pyserial background thread);
   `latest_m()` returns None if the reading is older than 300 ms or is -1.
   `navigation/range_fusion.py` (config `range_fusion:`) fuses it with the detections each frame:
