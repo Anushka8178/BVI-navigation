@@ -5,8 +5,8 @@
  * Serial: 115200 baud, one line per reading, about 15 lines a second:
  *     D,<distance_cm>,<esp_millis>     e.g. "D,123.4,56789"
  *     D,-1,<esp_millis>                no echo / out of range
- * Each reading is the median of 3 pings (a timeout counts as "no echo",
- * so 2 or more timeouts give -1).
+ * One ping per reading (the HC-SR04 needs ~60 ms between pings); each line
+ * is the median of the last 3 pings, so 2 or more misses in the last 3 give -1.
  *
  * Wiring: the HC-SR04 is powered from the ESP32 VIN pin (5 V from USB),
  * because it did not range reliably at 3.3 V. At 5 V its Echo output is a
@@ -38,16 +38,29 @@
 const int TRIG_PIN = 26;
 const int ECHO_PIN = 27;
 
-const unsigned long PERIOD_MS = 66;          // ~15 readings per second
+const unsigned long PERIOD_MS = 66;          // ~15 readings per second (>= 60 ms between pings)
 const unsigned long ECHO_TIMEOUT_US = 30000; // ~5 m round trip
+const unsigned long ECHO_IDLE_WAIT_MS = 50;  // wait for a stuck-HIGH Echo to clear
 const float MIN_CM = 2.0;                    // HC-SR04 spec range
 const float MAX_CM = 400.0;
 const float NO_ECHO = -1.0;
+const float MISS = 1e9;                      // a miss sorts as "infinitely far"
 
 unsigned long lastReadingMs = 0;
+float recent[3] = {MISS, MISS, MISS};        // last 3 pings
+int recentIndex = 0;
 
 // One ping; returns distance in cm, or NO_ECHO.
 float pingCm() {
+  // Some HC-SR04 modules hold Echo HIGH for a while after a missed echo and
+  // ignore new triggers until it drops. Wait for it to go LOW first.
+  unsigned long waitStart = millis();
+  while (digitalRead(ECHO_PIN) == HIGH) {
+    if (millis() - waitStart > ECHO_IDLE_WAIT_MS) {
+      return NO_ECHO;
+    }
+  }
+
   digitalWrite(TRIG_PIN, LOW);
   delayMicroseconds(2);
   digitalWrite(TRIG_PIN, HIGH);
@@ -65,20 +78,17 @@ float pingCm() {
   return cm;
 }
 
-// Median of 3 pings. A missing echo sorts as "infinitely far", so the
-// median is only valid when at least 2 of the 3 pings got an echo.
-float medianOf3Cm() {
-  float v[3];
-  for (int i = 0; i < 3; i++) {
-    float cm = pingCm();
-    v[i] = (cm < 0) ? 1e9 : cm;
-    delay(5);  // let the previous echo die out
-  }
-  // Sort 3 values.
+// Add one ping to the last-3 window and return the median.
+// The median is only valid when at least 2 of the last 3 pings got an echo.
+float rollingMedianCm(float cm) {
+  recent[recentIndex] = (cm < 0) ? MISS : cm;
+  recentIndex = (recentIndex + 1) % 3;
+
+  float v[3] = {recent[0], recent[1], recent[2]};
   if (v[0] > v[1]) { float t = v[0]; v[0] = v[1]; v[1] = t; }
   if (v[1] > v[2]) { float t = v[1]; v[1] = v[2]; v[2] = t; }
   if (v[0] > v[1]) { float t = v[0]; v[0] = v[1]; v[1] = t; }
-  return (v[1] >= 1e9) ? NO_ECHO : v[1];
+  return (v[1] >= MISS) ? NO_ECHO : v[1];
 }
 
 void setup() {
@@ -97,7 +107,7 @@ void loop() {
   }
   lastReadingMs = now;
 
-  float cm = medianOf3Cm();
+  float cm = rollingMedianCm(pingCm());
   if (cm < 0) {
     Serial.printf("D,-1,%lu\n", millis());
   } else {
