@@ -83,6 +83,38 @@ def test_agreeing_close_reading_corrects_instead_of_adding():
     assert result.detections[0].distance == pytest.approx(1.0)
 
 
+def test_reading_much_farther_than_camera_is_ignored():
+    # Camera: person 1.0 m ahead. Ultrasonic: 3.0 m (beam passes beside them).
+    # Ratio 1/3 is outside agree_ratio, and 3.0 m is not an unknown obstacle.
+    person = det("person-2", 1.0, 0.0, "person")
+    result = fuse_range([person], 3.0, CFG)
+    assert result.corrected_id is None and not result.added_unknown
+    assert result.detections == [person]
+
+
+def test_agree_ratio_boundary_still_corrects():
+    result = fuse_range([det("pole-1", 2.0, 0.0)], 1.0, CFG)  # ratio exactly 2.0
+    assert result.corrected_id == "pole-1"
+    assert result.detections[0].distance == pytest.approx(1.0)
+    result = fuse_range([det("pole-1", 2.01, 0.0)], 1.0, CFG)  # just outside
+    assert result.corrected_id is None and result.added_unknown
+
+
+def test_unknown_obstacle_threshold_is_strict():
+    assert not fuse_range([], CFG.unknown_obstacle_m, CFG).added_unknown
+    assert fuse_range([], CFG.unknown_obstacle_m - 0.01, CFG).added_unknown
+
+
+def test_very_close_reading_alerts_even_below_min_m():
+    # 0.1 m is below min_m, so it is not forced onto the cone detection,
+    # but something is right in front of the user: always alert.
+    pole = det("pole-1", 0.12, 0.0)
+    result = fuse_range([pole], 0.1, CFG)
+    assert result.corrected_id is None
+    assert result.detections[0] == pole
+    assert result.added_unknown and result.detections[-1].relative_y == 0.1
+
+
 def test_config_section():
     section = load_config()["range_fusion"]
     assert RangeFusionConfig.from_config(section) == CFG

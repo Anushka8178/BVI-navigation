@@ -48,6 +48,13 @@ class FakeSerial:
         (b"V,100\n", None),
         (b"D,nan,1\n", None),
         (b"\xff\xfeD,1,2\n", (1.0, 2)),   # non-ASCII boot noise is dropped
+        (b"D,12.3,567D,45.6,890\n", None),  # two readings glued together
+        (b"D,123.4,\n", None),            # truncated: no millis
+        (b"D,,5\n", None),                # empty distance
+        (b"D,-1,\n", None),               # truncated no-echo line
+        (b"D,1,2,3\n", None),             # extra field
+        (b"D,40.0,-3\n", None),           # negative millis
+        (b"\r\n", None),
     ],
 )
 def test_parse_line(line, expected):
@@ -126,6 +133,72 @@ def test_missing_port_warns_once_and_never_raises(capsys):
     out = capsys.readouterr().out
     assert out.count("WARNING") == 1
     assert "COM99" in out and "--no-esp32" in out
+
+
+class UnpluggedSerial(FakeSerial):
+    """Serves its lines, then fails like a pulled USB cable."""
+
+    def readline(self) -> bytes:
+        if self.lines:
+            return self.lines.pop(0)
+        self.drained.set()
+        raise OSError("ClearCommError failed (device disconnected)")
+
+
+def test_unplug_warns_once_then_reconnects_and_reads_again(capsys):
+    # Port 1: two readings, then the cable is pulled. Opening fails twice
+    # (still unplugged), then port 2 (plugged back in) serves new readings.
+    first = UnpluggedSerial([b"D,100,1\n", b"D,90,2\n"])
+    second = FakeSerial([b"# esp32_range ready\r\n", b"D,55.5,10\n"])
+    opens = []
+
+    def factory(port, baud, timeout):
+        opens.append(port)
+        if len(opens) == 1:
+            return first
+        if len(opens) <= 3:
+            raise OSError("could not open port 'COM5'")
+        return second
+
+    sensor = RangeSensor("COM5", serial_factory=factory, reconnect_delay_s=0.01)
+    sensor.start()
+    try:
+        assert second.drained.wait(3.0)
+        assert sensor.connected
+        assert sensor.latest().esp_millis == 10
+        assert sensor.latest_m() == pytest.approx(0.555)
+        assert sensor.lines_parsed == 3
+    finally:
+        sensor.close()
+
+    assert first.closed and second.closed
+    out = capsys.readouterr().out
+    # One warning for the unplug, none for the failed reopen attempts,
+    # and one line when it is back.
+    assert out.count("WARNING") == 1
+    assert "reconnecting" in out
+    assert out.count("ESP32 range sensor connected on COM5") == 1
+
+
+def test_stale_or_no_echo_reading_leaves_fusion_unchanged():
+    from navigation.range_fusion import RangeFusionConfig, fuse_range
+    from navigation.models import Detection
+
+    clock = FakeClock()
+    sensor = make_sensor(clock)
+    cfg = RangeFusionConfig()
+    detections = [Detection("pole-1", "pole", 0.0, 3.0, 0.8)]
+
+    sensor.feed_line(b"D,50,1\n")  # 0.5 m: would add an unknown obstacle
+    assert fuse_range(detections, sensor.latest_m(), cfg).added_unknown
+
+    clock.t += 0.31  # stale
+    result = fuse_range(detections, sensor.latest_m(), cfg)
+    assert result.detections == detections and not result.added_unknown
+
+    sensor.feed_line(b"D,-1,2\n")  # no echo
+    result = fuse_range(detections, sensor.latest_m(), cfg)
+    assert result.detections == detections and result.corrected_id is None
 
 
 def test_from_config_uses_esp32_section():
