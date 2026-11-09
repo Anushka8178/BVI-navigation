@@ -77,7 +77,12 @@ from navigation.minimap import draw_minimap
 from navigation.path_overlay import draw_lanes, lanes_for_minimap
 from navigation.models import FramePacket, Pose
 from navigation.planner import LocalPathPlanner
-from navigation.range_fusion import UNKNOWN_OBSTACLE, RangeFusionConfig, fuse_range
+from navigation.range_fusion import (
+    UNKNOWN_OBSTACLE,
+    RangeFusionConfig,
+    describe_fusion,
+    fuse_range,
+)
 from navigation.range_sensor import RangeSensor
 from navigation.reasoning import AcousticAttention
 from navigation.sensing import PhonePose, localize_detection, simulated_pose
@@ -126,10 +131,12 @@ def draw_status(
     audio_enabled: bool,
     pose_mode: str = "sim",
     memory_line: str | None = None,
+    range_line: str | None = None,
 ) -> None:
     """Draw a compact navigation status panel on the frame.
 
     memory_line: "Memory cue: ..." while a memory early-warning cue is recent.
+    range_line: ultrasonic fusion status (range_fusion.describe_fusion).
     """
     image_height, image_width = image.shape[:2]
     panel_height = min(330, image_height)
@@ -159,6 +166,8 @@ def draw_status(
         f"Detections: {detection_count} | Urgent warnings: {len(warnings)}",
         f"Spatial audio: {'ON' if audio_enabled else 'OFF'}",
     ]
+    if range_line:
+        lines.append(range_line)
 
     if path_decision.current_path_safe:
         lines.append("PATH: SAFE | continue ahead")
@@ -211,6 +220,8 @@ def draw_status(
             colour = (0, 180, 0)
         elif line.startswith("Memory cue"):
             colour = (0, 200, 255)  # amber, as the mini-map ring
+        elif line.startswith("Range:"):
+            colour = (0, 0, 255) if "UNKNOWN" in line else (255, 255, 0)  # red / cyan
         else:
             colour = (255, 255, 255)
 
@@ -715,6 +726,7 @@ def main() -> None:
 
             # Ultrasonic fusion: measured distance for the detection straight
             # ahead, or an "unknown_obstacle" YOLO did not see.
+            fusion = None
             if range_sensor is not None:
                 fusion = fuse_range(detections, range_sensor.latest_m(), fusion_cfg)
                 detections = fusion.detections
@@ -1034,6 +1046,10 @@ def main() -> None:
                 audio_enabled=hrtf_renderer is not None,
                 pose_mode=pose_mode,
                 memory_line=memory_line,
+                range_line=describe_fusion(
+                    fusion,
+                    range_sensor is not None and range_sensor.connected,
+                ),
             )
 
             if not args.no_lanes:

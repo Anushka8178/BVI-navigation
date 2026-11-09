@@ -115,6 +115,19 @@ def test_very_close_reading_alerts_even_below_min_m():
     assert result.added_unknown and result.detections[-1].relative_y == 0.1
 
 
+def test_describe_fusion_status_line():
+    from navigation.range_fusion import describe_fusion
+
+    assert describe_fusion(None, False) == "Range: off (--no-esp32)"
+    assert describe_fusion(fuse_range([], None, CFG), False) == "Range: ESP32 not connected"
+    assert describe_fusion(fuse_range([], None, CFG), True) == "Range: no reading"
+    corrected = fuse_range([det("person-3", 1.4, 0.0, "person")], 0.98, CFG)
+    assert describe_fusion(corrected, True) == "Range: 0.98 m -> person-3 (ultrasonic distance)"
+    unknown = fuse_range([], 1.0, CFG)
+    assert describe_fusion(unknown, True) == "Range: 1.00 m UNKNOWN OBSTACLE ahead"
+    assert describe_fusion(fuse_range([], 3.0, CFG), True) == "Range: 3.00 m (no match)"
+
+
 def test_config_section():
     section = load_config()["range_fusion"]
     assert RangeFusionConfig.from_config(section) == CFG

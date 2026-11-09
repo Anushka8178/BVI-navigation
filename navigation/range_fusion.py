@@ -56,6 +56,23 @@ class FusionResult:
     range_m: float | None = None
 
 
+def describe_fusion(result: FusionResult | None, connected: bool) -> str:
+    """One status-panel line: what the ultrasonic sensor did this frame.
+
+    result None = the range sensor is off (--no-esp32).
+    """
+    if result is None:
+        return "Range: off (--no-esp32)"
+    if result.range_m is None or result.range_m <= 0.0:
+        return "Range: no reading" if connected else "Range: ESP32 not connected"
+    text = f"Range: {result.range_m:.2f} m"
+    if result.corrected_id is not None:
+        return f"{text} -> {result.corrected_id} (ultrasonic distance)"
+    if result.added_unknown:
+        return f"{text} UNKNOWN OBSTACLE ahead"
+    return f"{text} (no match)"
+
+
 def with_distance(detection: Detection, distance_m: float) -> Detection:
     """Same detection and bearing, at a new distance."""
     current = detection.distance
