@@ -11,6 +11,7 @@ python -m scripts.manual.test_hrtf
 
 | Script | Needs | What it checks |
 |---|---|---|
+| `check_esp32.py` | ESP32 + HC-SR04 on USB (close the Arduino Serial Monitor first) | Lists COM ports, prints live distance and rate, ~15 Hz expected (`--port COM5`, `--list`) |
 | `check_phone_pose.py` | phone running SensorServer | Prints live heading, x, y, steps (`--seconds 20`) |
 | `test_audio_device.py` | audio device | Lists/finds the named output device via `sounddevice` |
 | `test_hrtf.py` | earphones | Plays HRTF warnings at left / ahead / right |

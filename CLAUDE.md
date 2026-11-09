@@ -25,7 +25,8 @@ Do not rewrite modules that already work.
 
 ### ESP32 → laptop protocol (USB serial, 115200 baud, plain ASCII, one line per reading)
 - Firmware: `firmware/esp32_range/esp32_range.ino` (Arduino IDE, board "ESP32 Dev Module").
-- ESP32 prints `D,<distance_cm>,<esp_millis>` about 15 times a second (median of 3 pings).
+- ESP32 prints `D,<distance_cm>,<esp_millis>` about 15 times a second: one ping per reading
+  (66 ms apart), each line the rolling median of the last 3 pings (-1 if 2 of the 3 missed).
   If there's no echo, it prints `D,-1,<esp_millis>`. Other lines (boot messages) are ignored.
 - One-way only: the laptop sends nothing to the ESP32.
 - Wiring (sensor powered from 5 V because it was unreliable at 3.3 V; ESP32 GPIOs are not
@@ -136,7 +137,7 @@ Still open:
 - After every change, run `python -m pytest -q` and show the result. Add or extend a test for any
   logic you change (pure-logic tests must not need a camera, phone, GPU or audio device).
 - Code that needs hardware (phone, ESP32, audio) must fail gracefully, with a clear message and a
-  `--no-audio` / `--no-esp32` / `--sim-pose` fallback, so the pipeline still runs on a recorded video.
+  `--no-audio` / `--no-esp32` / `--no-phone` / `--pose sim` fallback, so the pipeline still runs on a recorded video.
 - Never commit generated files: `videos/*_navigation.*`, `*.db`, `runs/`, `datasets/`, recordings.
 - Windows + PowerShell is the main environment: use `pathlib`, no bash-only commands in docs.
 - Keep `requirements.txt` the single source of dependency truth; add a dependency only if needed
